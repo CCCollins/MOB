@@ -1,0 +1,7 @@
+{
+    "bg_interval": 28800,
+    "max_iterations": 10,
+    "log_level": "INFO",
+    "model_main": "google/gemini-3-flash-preview",
+    "model_expert": "anthropic/claude-haiku-4.5"
+}

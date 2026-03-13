@@ -1,4 +1,5 @@
 /custom_tools
+/__pycache__
 .env
 *.db
 *.jpg

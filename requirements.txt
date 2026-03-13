@@ -2,3 +2,6 @@ python-dotenv
 aiogram
 openai
 aiohttp
+pillow
+customtkinter
+psutil
