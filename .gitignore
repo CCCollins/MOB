@@ -1,3 +1,5 @@
+/custom_tools
 .env
 *.db
 *.jpg
+*.txt
