@@ -5,7 +5,8 @@ import logging
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.methods import TelegramMethod
-from config import get_env
+from aiogram.types import FSInputFile
+from config import get_config
 import agent
 import database as db
 import tools
@@ -22,35 +23,26 @@ class SendMessageDraft(TelegramMethod[bool]):
 dp = Dispatcher()
 
 def is_allowed(user_id: int) -> bool:
-    raw_ids = get_env("ALLOWED_TELEGRAM_IDS")
+    raw_ids = get_config("ALLOWED_TELEGRAM_IDS")
     if not raw_ids: return False
     allowed =[int(x.strip()) for x in raw_ids.split(",") if x.strip()]
     return user_id in allowed
 
 def get_tg_updater(message: types.Message, bot: Bot):
-    """Генерирует коллбэк для стриминга в Telegram"""
     async def tg_updater(text, is_final=False):
         if is_final:
-            # 1. Безопасно очищаем черновик (пробел нужен, чтобы API не вернул ошибку 400)
-            try:
-                await bot(SendMessageDraft(chat_id=message.chat.id, draft_id=message.message_id, text=" "))
-            except Exception: pass
+            try: await bot(SendMessageDraft(chat_id=message.chat.id, draft_id=message.message_id, text=" "))
+            except: pass
             
-            # 2. Отправляем полноценное финальное сообщение
-            try:
-                await bot.send_message(message.chat.id, text, parse_mode="Markdown")
-            except Exception:
-                try:
-                    await bot.send_message(message.chat.id, text)
-                except Exception as e:
-                    logging.error(f"Не удалось отправить финальное сообщение в TG: {e}")
+            try: await bot.send_message(message.chat.id, text, parse_mode="Markdown")
+            except:
+                try: await bot.send_message(message.chat.id, text)
+                except Exception as e: logging.error(f"TG Error: {e}")
         else:
-            # 3. Обновляем черновик при стриминге
             try:
-                p_mode = "HTML" if text.startswith(("⏳", "🛠", "⚠️", "❌")) else None
+                p_mode = "HTML" if "🛠" in text or "⏳" in text or "❌" in text else None
                 await bot(SendMessageDraft(chat_id=message.chat.id, draft_id=message.message_id, text=text[:4096], parse_mode=p_mode))
-            except Exception: pass
-            
+            except: pass
     return tg_updater
 
 @dp.message(Command("reset"))
@@ -66,11 +58,27 @@ async def cmd_memorize(message: types.Message, bot: Bot):
     prompt = "ПРИНУДИТЕЛЬНАЯ ИНСТРУКЦИЯ: Изучи наш последний диалог и сохрани факты..."
     await agent.run_agent(str(message.from_user.id), prompt, tg_update_callback=get_tg_updater(message, bot), bot_instance=bot)
 
+@dp.message(Command("screenshot"))
+async def cmd_screenshot(message: types.Message, bot: Bot):
+    if not is_allowed(message.from_user.id): return
+    await message.answer("📸 Делаю скриншот...")
+    result = await tools.take_screenshot()
+    if result.startswith("Ошибка"):
+        await message.answer(result)
+        return
+    try:
+        photo = FSInputFile(result)
+        await bot.send_photo(message.chat.id, photo)
+    except Exception as e:
+        try:
+            doc = FSInputFile(result)
+            await bot.send_document(message.chat.id, doc)
+        except Exception as e2:
+            await message.answer(f"Не удалось отправить файл: {e2}")
+
 @dp.message(F.text)
 async def handle_text(message: types.Message, bot: Bot):
-    if not is_allowed(message.from_user.id):
-        logging.warning(f"🚫 Отказ в доступе. Ваш ID: {message.from_user.id}.")
-        return
+    if not is_allowed(message.from_user.id): return
     await agent.run_agent(str(message.from_user.id), message.text, tg_update_callback=get_tg_updater(message, bot), bot_instance=bot)
 
 @dp.message(F.photo | F.document)
@@ -98,6 +106,6 @@ async def handle_files(message: types.Message, bot: Bot):
     elif message.photo or ext in['jpg', 'jpeg', 'png']:
         with open(tmp_path, 'rb') as img_file:
             content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64.b64encode(img_file.read()).decode('utf-8')}"}})
-    else: content[0]["text"] += f"\n[СИСТЕМА]: Файл сохранен: {tmp_path}"
+    else: content[0]["text"] += f"\n[СИСТЕМА]: Файл сохранен: {tmp_path.replace(chr(92), '/')}"
 
     await agent.run_agent(str(message.from_user.id), content, tg_update_callback=get_tg_updater(message, bot), bot_instance=bot)

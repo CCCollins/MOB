@@ -5,14 +5,31 @@ import os
 import json
 import io
 import tempfile
+import time
 import re
-from config import get_env
+from config import get_config
 
 def make_safe_filename(filename: str) -> str:
     return re.sub(r'[^\x00-\x7F]+', '_', filename)
 
+async def take_screenshot(output_path: str | None = None) -> str:
+    try: from PIL import ImageGrab
+    except Exception as e: return f"Ошибка: не удалось импортировать PIL: {e}"
+
+    try:
+        screenshot = ImageGrab.grab()
+        if not output_path:
+            output_path = os.path.join(tempfile.gettempdir(), f"screenshot_{int(time.time())}.png")
+        else:
+            output_path = os.path.abspath(output_path)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        screenshot.save(output_path)
+        return output_path.replace("\\", "/")
+    except Exception as e:
+        return f"Ошибка: {str(e)}"
+
 async def convert_to_pdf(file_path: str, original_filename: str) -> str | None:
-    api_key = get_env("DYNAMICPDF_API_KEY")
+    api_key = get_config("DYNAMICPDF_API_KEY")
     if not api_key: return None
     ext = original_filename.lower().split('.')[-1]
     if ext in ['docx', 'doc']: input_type, mime = "word", 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
@@ -33,7 +50,7 @@ async def convert_to_pdf(file_path: str, original_filename: str) -> str | None:
                     pdf_content = await resp.read()
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(pdf_content)
-                return tmp.name
+                return tmp.name.replace("\\", "/")
     except: return None
 
 async def execute_terminal(command: str) -> str:
@@ -49,7 +66,7 @@ async def execute_terminal(command: str) -> str:
     except Exception as e: return f"Ошибка: {str(e)}"
 
 async def web_search(query: str) -> str:
-    api_key = get_env("BRAVE_API_KEY")
+    api_key = get_config("BRAVE_API_KEY")
     if not api_key: return "Ключ Brave API не настроен."
     async with aiohttp.ClientSession() as session:
         async with session.get("https://api.search.brave.com/res/v1/web/search", headers={"Accept": "application/json", "X-Subscription-Token": api_key}, params={"q": query}) as response:
@@ -67,5 +84,5 @@ async def file_operation(action: str, filepath: str, content: str = "") -> str:
         elif action == "write":
             os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
             with open(filepath, 'w', encoding='utf-8') as f: f.write(content)
-            return f"Файл {filepath} записан."
+            return f"Файл записан: {filepath.replace(chr(92), '/')}"
     except Exception as e: return f"Ошибка: {str(e)}"

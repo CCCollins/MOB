@@ -1,8 +1,10 @@
 import sqlite3
 import json
+import os
 from datetime import datetime
+from config import get_config_dir
 
-DB_FILE = "agent_memory.db"
+DB_FILE = os.path.join(get_config_dir(), "agent_memory.db")
 
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:

@@ -1,6 +1,10 @@
 /custom_tools
 /__pycache__
+/dist
+/build
 .env
 *.db
 *.jpg
 *.txt
+*.spec
+*iss
