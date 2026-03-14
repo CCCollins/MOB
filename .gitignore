@@ -1,10 +1,13 @@
 /custom_tools
 /__pycache__
+/screenshots
 /dist
 /build
+/EXE
 .env
 *.db
 *.jpg
 *.txt
 *.spec
-*iss
+*.iss
+*.exe

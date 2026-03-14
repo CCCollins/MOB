@@ -7,62 +7,235 @@ import io
 import tempfile
 import time
 import re
+import base64
 from config import get_config
+from openai import AsyncOpenAI
+import pyautogui
+import pyperclip
+from PIL import Image, ImageDraw, ImageFont, ImageGrab
+
+_screenshots_cleared = False
+
+def _get_screenshot_dir(clean: bool = False) -> str:
+    """Возвращает папку для скриншотов: work_dir из конфига или папка рядом с exe."""
+    global _screenshots_cleared
+    work_dir = get_config("work_dir") or ""
+    if work_dir and os.path.isdir(work_dir):
+        base = work_dir
+    else:
+        # Fallback: папка рядом с исполняемым файлом (не внутри _MEIPASS)
+        if getattr(__import__("sys"), "_MEIPASS", None):
+            base = os.path.dirname(__import__("sys").executable)
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+    screenshot_dir = os.path.join(base, "screenshots")
+    os.makedirs(screenshot_dir, exist_ok=True)
+    if clean and not _screenshots_cleared:
+        for fname in os.listdir(screenshot_dir):
+            try: os.remove(os.path.join(screenshot_dir, fname))
+            except Exception: pass
+        _screenshots_cleared = True
+    return screenshot_dir
 
 def make_safe_filename(filename: str) -> str:
     return re.sub(r'[^\x00-\x7F]+', '_', filename)
 
-async def take_screenshot(output_path: str | None = None) -> str:
-    try: from PIL import ImageGrab
-    except Exception as e: return f"Ошибка: не удалось импортировать PIL: {e}"
-
+def _minimize_telegram():
     try:
-        screenshot = ImageGrab.grab()
-        if not output_path:
-            output_path = os.path.join(tempfile.gettempdir(), f"screenshot_{int(time.time())}.png")
+        if platform.system() == "Windows":
+            import ctypes, ctypes.wintypes
+            EnumWindows = ctypes.windll.user32.EnumWindows
+            EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+            GetWindowTextW = ctypes.windll.user32.GetWindowTextW
+            IsWindowVisible = ctypes.windll.user32.IsWindowVisible
+            ShowWindow = ctypes.windll.user32.ShowWindow
+            handles =[]
+            def _cb(hwnd, _):
+                if IsWindowVisible(hwnd):
+                    buf = ctypes.create_unicode_buffer(256)
+                    GetWindowTextW(hwnd, buf, 256)
+                    if "telegram" in buf.value.lower(): handles.append(hwnd)
+                return True
+            EnumWindows(EnumWindowsProc(_cb), 0)
+            for hwnd in handles: ShowWindow(hwnd, 6)
+    except Exception: pass
+
+# --- ФУНКЦИИ ОС И КЛАВИАТУРЫ ---
+
+async def type_text(text: str) -> str:
+    """Вводит текст. Автоматически переключает раскладку на Windows и использует надежный Shift+Insert."""
+    try:
+        # 1. Автоматическое переключение раскладки (Windows API)
+        if platform.system() == "Windows":
+            import ctypes
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            has_ru = any('\u0400' <= c <= '\u04FF' for c in text)
+            layout = 0x04190419 if has_ru else 0x04090409
+            
+            ctypes.windll.user32.PostMessageW(hwnd, 0x0050, 0, layout)
+            await asyncio.sleep(0.1)
+        elif platform.system() == "Linux":
+            try:
+                import subprocess
+                has_ru = any('\u0400' <= c <= '\u04FF' for c in text)
+                layout = 'ru' if has_ru else 'us'
+                subprocess.run(['setxkbmap', layout], check=True)
+                await asyncio.sleep(0.1)
+            except Exception:
+                pass
+
+        # 2. Отпускаем залипшие клавиши-модификаторы
+        for key in['ctrl', 'alt', 'shift', 'win', 'command']:
+            pyautogui.keyUp(key)
+            
+        # 3. Копируем текст и вставляем через независимую от языка комбинацию
+        pyperclip.copy(text)
+        await asyncio.sleep(0.2)
+        
+        if platform.system() == "Darwin":
+            pyautogui.hotkey('command', 'v')
         else:
-            output_path = os.path.abspath(output_path)
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            pyautogui.hotkey('shift', 'insert')
+            
+        await asyncio.sleep(0.1)
+        return f"Текст успешно напечатан: {text}"
+    except Exception as e:
+        try:
+            from pynput.keyboard import Controller
+            keyboard = Controller()
+            keyboard.type(text)
+            return f"Текст напечатан через pynput: {text}"
+        except Exception as e2:
+            return f"Ошибка ввода текста: {e2}"
+
+async def press_key(key: str) -> str:
+    try:
+        pyautogui.press(key)
+        return f"Клавиша '{key}' нажата"
+    except Exception as e: return f"Ошибка нажатия: {str(e)}"
+
+async def hotkey(*keys: str) -> str:
+    try:
+        pyautogui.hotkey(*keys)
+        return f"Горячая клавиша {'+'.join(keys)} нажата"
+    except Exception as e: return f"Ошибка горячей клавиши: {str(e)}"
+
+# --- СКРИНШОТЫ И ЗРЕНИЕ ---
+
+async def take_screenshot(output_path: str | None = None, minimize_telegram: bool = True) -> str:
+    try:
+        if minimize_telegram:
+            _minimize_telegram()
+            await asyncio.sleep(0.5)
+        screenshot = ImageGrab.grab()
+        screenshots_dir = _get_screenshot_dir(clean=True)
+        filename = os.path.basename(output_path) if output_path else f"screenshot_{int(time.time())}.png"
+        output_path = os.path.join(screenshots_dir, filename)
         screenshot.save(output_path)
         return output_path.replace("\\", "/")
     except Exception as e:
         return f"Ошибка: {str(e)}"
 
+def _get_font(size: int = 13):
+    for path in["arialbd.ttf", "arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]:
+        try: return ImageFont.truetype(path, size)
+        except Exception: pass
+    return ImageFont.load_default()
+
+def _annotate_with_grid(image_path: str, cols: int = 10, rows: int = 7) -> tuple[str, dict]:
+    img = Image.open(image_path).convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = _get_font(13)
+    w, h = img.size
+    step_x, step_y = w // cols, h // rows
+    coords_map = {}
+
+    for row in range(rows + 1):
+        for col in range(cols + 1):
+            cx, cy = min(col * step_x, w - 1), min(row * step_y, h - 1)
+            label = f"({cx},{cy})"
+            coords_map[label] = (cx, cy)
+            draw.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=(255, 60, 60, 230))
+            tx, ty = min(cx + 6, w - 40), min(cy + 4, h - 20)
+            draw.rectangle([tx - 2, ty - 2, tx + 40, ty + 15], fill=(0, 0, 0, 170))
+            draw.text((tx, ty), label, fill=(255, 230, 80, 255), font=font)
+
+    result = Image.alpha_composite(img, overlay).convert("RGB")
+    out_path = image_path.replace(".png", "_grid.png")
+    result.save(out_path)
+    return out_path.replace("\\", "/"), coords_map
+
+async def take_annotated_screenshot(output_path: str | None = None) -> tuple[str, str, dict]:
+    orig_path = await take_screenshot(output_path)
+    if orig_path.startswith("Ошибка"): return orig_path, orig_path, {}
+    grid_path, coords_map = _annotate_with_grid(orig_path)
+    return orig_path, grid_path, coords_map
+
+async def analyze_screenshot(image_path: str, prompt: str, use_grid: bool = False) -> str:
+    try:
+        client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=get_config("OPENROUTER_API_KEY"))
+        actual_path = image_path
+        grid_hint = ""
+        if use_grid:
+            actual_path, _ = _annotate_with_grid(image_path)
+            grid_hint = "\nНА СКРИНШОТЕ НАНЕСЕНА СЕТКА. Назови координаты (x,y) ближайшей точки к нужному элементу."
+        with open(actual_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        response = await client.chat.completions.create(
+            model=get_config("model_main"),
+            messages=[{"role": "user", "content":[{"type": "text", "text": prompt + grid_hint}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]}]
+        )
+        return response.choices[0].message.content
+    except Exception as e: return f"Ошибка анализа: {str(e)}"
+
+async def smart_click(prompt: str, max_attempts: int = 3) -> str:
+    try:
+        orig_path, grid_path, _ = await take_annotated_screenshot()
+        if orig_path.startswith("Ошибка"): return orig_path
+        ai_prompt = f"Найди на скриншоте элемент: «{prompt}»\nОТВЕТЬ СТРОГО В ФОРМАТЕ: (x,y) — точные координаты центра элемента. Пример: (320,240)"
+        for _ in range(max_attempts):
+            resp = await analyze_screenshot(grid_path, ai_prompt)
+            m = re.search(r"\(?\s*(-?\d+)\s*[;,]\s*(-?\d+)\s*\)?", resp)
+            if m:
+                x, y = int(m.group(1)), int(m.group(2))
+                pyautogui.click(x, y)
+                return f"Клик по «{prompt}» в ({x}, {y})"
+            await asyncio.sleep(0.3)
+        return f"Не удалось определить координаты. Ответ ИИ: {resp}"
+    except Exception as e: return f"Ошибка smart_click: {str(e)}"
+
+# --- ПРОЧИЕ ИНСТРУМЕНТЫ ---
+
 async def convert_to_pdf(file_path: str, original_filename: str) -> str | None:
     api_key = get_config("DYNAMICPDF_API_KEY")
     if not api_key: return None
     ext = original_filename.lower().split('.')[-1]
-    if ext in ['docx', 'doc']: input_type, mime = "word", 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    elif ext in['xlsx', 'xls']: input_type, mime = "excel", 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    if ext in['docx', 'doc']: input_type, mime = "word", 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    elif ext in ['xlsx', 'xls']: input_type, mime = "excel", 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     else: return None
-
     resource_name = make_safe_filename(original_filename)
-    instructions = json.dumps({"inputs":[{"type": input_type, "resourceName": resource_name}]})
-    
     try:
         async with aiohttp.ClientSession() as session:
             with open(file_path, 'rb') as f:
                 form = aiohttp.FormData()
-                form.add_field('Instructions', io.BytesIO(instructions.encode('utf-8')), filename='instructions.json', content_type='application/json')
+                form.add_field('Instructions', io.BytesIO(json.dumps({"inputs":[{"type": input_type, "resourceName": resource_name}]}).encode('utf-8')), filename='instructions.json', content_type='application/json')
                 form.add_field('Resource', f, filename=resource_name, content_type=mime)
                 async with session.post("https://api.dpdf.io/v1.0/pdf", headers={"Authorization": f"Bearer {api_key}"}, data=form, ssl=False) as resp:
                     if resp.status != 200: return None
                     pdf_content = await resp.read()
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(pdf_content)
-                return tmp.name.replace("\\", "/")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(pdf_content)
+            return tmp.name.replace("\\", "/")
     except: return None
 
 async def execute_terminal(command: str) -> str:
     try:
-        if platform.system() == "Windows":
-            shell_cmd = f"powershell -NoProfile -Command \"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {command}\""
-        else: shell_cmd = command
+        shell_cmd = f"powershell -NoProfile -Command \"[Console]::OutputEncoding =[System.Text.Encoding]::UTF8; {command}\"" if platform.system() == "Windows" else command
         process = await asyncio.create_subprocess_shell(shell_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120.0)
         output = stdout.decode('utf-8', errors='replace') + stderr.decode('utf-8', errors='replace')
-        if len(output) > 2000: return output[:2000] + "\n...[ОБРЕЗАНО]..."
-        return output if output.strip() else "Успешно (нет вывода)."
+        return output[:2000] + "\n...[ОБРЕЗАНО]..." if len(output) > 2000 else output if output.strip() else "Успешно."
     except Exception as e: return f"Ошибка: {str(e)}"
 
 async def web_search(query: str) -> str:
@@ -71,9 +244,7 @@ async def web_search(query: str) -> str:
     async with aiohttp.ClientSession() as session:
         async with session.get("https://api.search.brave.com/res/v1/web/search", headers={"Accept": "application/json", "X-Subscription-Token": api_key}, params={"q": query}) as response:
             if response.status != 200: return "Ошибка поиска."
-            data = await response.json()
-            results =[f"{i.get('title')} - {i.get('url')}\n{i.get('description')}" for i in data.get("web", {}).get("results", [])]
-            return "\n".join(results) if results else "Ничего не найдено."
+            return "\n".join([f"{i.get('title')} - {i.get('url')}\n{i.get('description')}" for i in (await response.json()).get("web", {}).get("results", [])]) or "Ничего не найдено."
 
 async def file_operation(action: str, filepath: str, content: str = "") -> str:
     try:
@@ -86,3 +257,22 @@ async def file_operation(action: str, filepath: str, content: str = "") -> str:
             with open(filepath, 'w', encoding='utf-8') as f: f.write(content)
             return f"Файл записан: {filepath.replace(chr(92), '/')}"
     except Exception as e: return f"Ошибка: {str(e)}"
+
+def _resolve_xy(x: float, y: float, relative: bool = False) -> tuple[int, int]:
+    w, h = pyautogui.size()
+    return int(x * w), int(y * h) if relative else (int(x), int(y))
+
+async def click_mouse(x: float, y: float, relative: bool = False, clicks: int = 1, button: str = "left") -> str:
+    try:
+        xx, yy = _resolve_xy(x, y, relative)
+        pyautogui.click(xx, yy, clicks=clicks, button=button)
+        return f"Клик ({button}) в ({xx}, {yy})"
+    except Exception as e: return f"Ошибка клика: {str(e)}"
+
+async def scroll_mouse(x: float, y: float, clicks: int, relative: bool = False) -> str:
+    try:
+        xx, yy = _resolve_xy(x, y, relative)
+        pyautogui.moveTo(xx, yy)
+        pyautogui.scroll(clicks, xx, yy)
+        return f"Скролл в ({xx}, {yy})"
+    except Exception as e: return f"Ошибка скролла: {str(e)}"

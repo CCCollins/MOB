@@ -2,7 +2,7 @@ import sqlite3
 import json
 import os
 from datetime import datetime
-from config import get_config_dir
+from config import get_config_dir, get_config
 
 DB_FILE = os.path.join(get_config_dir(), "agent_memory.db")
 
@@ -12,9 +12,10 @@ def init_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS chat_history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, message_json TEXT, timestamp DATETIME)''')
 
 def add_to_history(user_id: str, message: dict):
+    limit = int(get_config("history_limit") or 40)
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute("INSERT INTO chat_history (user_id, message_json, timestamp) VALUES (?, ?, ?)", (str(user_id), json.dumps(message), datetime.now().isoformat()))
-        conn.execute("DELETE FROM chat_history WHERE id NOT IN (SELECT id FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT 40) AND user_id = ?", (str(user_id), str(user_id)))
+        conn.execute("DELETE FROM chat_history WHERE id NOT IN (SELECT id FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT ?) AND user_id = ?", (str(user_id), limit, str(user_id)))
 
 def get_history(user_id: str) -> list:
     with sqlite3.connect(DB_FILE) as conn:

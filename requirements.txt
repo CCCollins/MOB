@@ -5,3 +5,7 @@ aiohttp
 pillow
 customtkinter
 psutil
+pyautogui
+opencv-python
+pynput
+pyperclip

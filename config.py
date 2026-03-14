@@ -10,7 +10,7 @@ def get_config_dir():
     else:
         base = os.path.join(os.path.expanduser("~"), ".config")
     
-    d = os.path.join(base, "AIAgentController")
+    d = os.path.join(base, "MOB")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -23,10 +23,13 @@ DEFAULT_CONFIG = {
     "BRAVE_API_KEY": "",
     "DYNAMICPDF_API_KEY": "",
     "bg_interval": 28800,
-    "max_iterations": 10,
+    "bg_autostart": False,
+    "max_iterations": 15,
+    "history_limit": 40,
     "log_level": "INFO",
     "model_main": "google/gemini-3-flash-preview",
-    "model_expert": "anthropic/claude-haiku-4.5"
+    "model_expert": "anthropic/claude-haiku-4.5",
+    "work_dir": ""
 }
 
 def init_configs():
