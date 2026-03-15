@@ -22,6 +22,7 @@ DEFAULT_CONFIG = {
     "OPENROUTER_API_KEY": "",
     "BRAVE_API_KEY": "",
     "DYNAMICPDF_API_KEY": "",
+    "PROXY_URL": "",
     "bg_interval": 28800,
     "bg_autostart": False,
     "max_iterations": 15,

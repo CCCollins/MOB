@@ -1,6 +1,9 @@
 /custom_tools
 /__pycache__
-/screenshots
+/interfaces/__pycache__
+/config/__pycache__
+/core/__pycache__
+/core/screenshots
 /dist
 /build
 /EXE

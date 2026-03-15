@@ -2,7 +2,7 @@ import sqlite3
 import json
 import os
 from datetime import datetime
-from config import get_config_dir, get_config
+from config.settings import get_config_dir, get_config
 
 DB_FILE = os.path.join(get_config_dir(), "agent_memory.db")
 
@@ -20,7 +20,7 @@ def add_to_history(user_id: str, message: dict):
 def get_history(user_id: str) -> list:
     with sqlite3.connect(DB_FILE) as conn:
         rows = conn.execute("SELECT message_json FROM chat_history WHERE user_id = ? ORDER BY id ASC", (str(user_id),)).fetchall()
-        return [json.loads(row[0]) for row in rows]
+        return[json.loads(row[0]) for row in rows]
 
 def clear_history(user_id: str):
     with sqlite3.connect(DB_FILE) as conn:

@@ -2,10 +2,11 @@ python-dotenv
 aiogram
 openai
 aiohttp
+aiohttp-socks
+httpx
 pillow
 customtkinter
 psutil
 pyautogui
-opencv-python
 pynput
 pyperclip

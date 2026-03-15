@@ -3,13 +3,18 @@ import time
 import platform
 import logging
 import asyncio
+import httpx
 from datetime import datetime
 from openai import AsyncOpenAI
 from aiogram.types import FSInputFile
-import database as db
-import tools
-import pyautogui
-from config import get_config
+import core.database as db
+import core.tools as tools
+from config.settings import get_config
+
+try:
+    import pyautogui
+except ImportError:
+    pyautogui = None
 
 log = logging.getLogger("Agent")
 
@@ -20,8 +25,9 @@ def get_system_prompt(source_channel: str) -> str:
     os_name = platform.system()
     if os_name == "Darwin": os_name = "macOS"
     current_time = datetime.now().strftime("%d.%m.%Y, %H:%M:%S (Локальное время)")
-    screen_size = pyautogui.size()
     
+    screen_info = f"ЭКРАН: {pyautogui.size()[0]}x{pyautogui.size()[1]}." if pyautogui else "ЭКРАН: Недоступен (Headless)."
+
     channel_info = f"СТРОГОЕ ПРАВИЛО КАНАЛА СВЯЗИ:\nТекущий запрос пришел из: {source_channel}.\n"
     if source_channel == "GUI":
         channel_info += "Ты общаешься в локальном графическом интерфейсе (GUI). Все твои текстовые ответы УЖЕ выводятся пользователю на экран. КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ использовать функцию `send_telegram_message` для ответа пользователю! Просто генерируй текст."
@@ -29,7 +35,7 @@ def get_system_prompt(source_channel: str) -> str:
         channel_info += "Пользователь пишет тебе из Telegram. Генерируй текст как обычно, он уйдет в Telegram автоматически. `send_telegram_message` используй ТОЛЬКО для инициации новых диалогов, когда ты просыпаешься сам в фоновом режиме."
 
     return f"""Ты — автономный, проактивный ИИ-агент (Оркестратор).
-ТЕКУЩАЯ СИСТЕМА: {os_name} ({platform.platform()}). ЭКРАН: {screen_size[0]}x{screen_size[1]}. ВРЕМЯ: {current_time}.
+ТЕКУЩАЯ СИСТЕМА: {os_name} ({platform.platform()}). {screen_info} ВРЕМЯ: {current_time}.
 {channel_info}
 
 УПРАВЛЕНИЕ ИНТЕРФЕЙСОМ ОС (GUI):
@@ -68,50 +74,38 @@ async def run_agent(user_id: str, user_message, source_channel="GUI", is_backgro
             await _run_agent_core(user_id, user_message, source_channel, is_background, tg_update_callback, gui_stream_callback, bot_instance)
         finally:
             active_sessions.pop(user_id, None)
+            
         return True
 
 async def _run_agent_core(user_id, user_message, source_channel, is_background, tg_update_callback, gui_stream_callback, bot_instance):
     if user_message: db.add_to_history(user_id, {"role": "user", "content": user_message})
 
     def _sanitize_messages(msgs):
-        """
-        Gemini требует строгое чередование: assistant(tool_calls) → tool → tool → ...
-        Правила:
-        - system-сообщения между tool_call и tool_result — удаляем
-        - осиротевшие tool_result без предшествующего tool_call — удаляем
-        - assistant(tool_calls) в конце без tool_result — удаляем вместе с предшествующим user
-        """
-        result = []
+        result =[]
         i = 0
         while i < len(msgs):
             msg = msgs[i]
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                # Смотрим вперёд: есть ли хоть один tool_result после (пропуская system)?
                 j = i + 1
                 while j < len(msgs) and msgs[j].get("role") == "system":
                     j += 1
                 has_results = j < len(msgs) and msgs[j].get("role") == "tool"
 
                 if not has_results:
-                    # Висячий tool_call — выбрасываем его и предшествующий user если есть
                     if result and result[-1].get("role") == "user":
                         result.pop()
                     i += 1
-                    # Пропускаем все system за ним
                     while i < len(msgs) and msgs[i].get("role") == "system":
                         i += 1
                 else:
                     result.append(msg)
                     i += 1
-                    # Пропускаем system между tool_call и tool_result
                     while i < len(msgs) and msgs[i].get("role") == "system":
                         i += 1
-                    # Собираем все tool_result
                     while i < len(msgs) and msgs[i].get("role") == "tool":
                         result.append(msgs[i])
                         i += 1
             elif msg.get("role") == "tool":
-                # Осиротевший tool_result — пропускаем
                 i += 1
             else:
                 result.append(msg)
@@ -121,16 +115,12 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
     raw_history = db.get_history(user_id)
     clean_history = _sanitize_messages(raw_history)
 
-    # Если санитизация что-то удалила — перезаписываем БД,
-    # чтобы битые записи не накапливались между сессиями
     if len(clean_history) != len(raw_history):
-        logging.warning(f"[Agent] История пользователя {user_id} содержала битые записи "
-                        f"({len(raw_history)} → {len(clean_history)}). Перезаписываю БД.")
+        logging.warning(f"[Agent] История пользователя {user_id} содержала битые записи. Перезаписываю БД.")
         db.clear_history(user_id)
         for msg in clean_history:
             db.add_to_history(user_id, msg)
 
-    # Автоматический поиск в долгосрочной памяти по теме сообщения
     memory_context = ""
     if user_message:
         query_text = user_message if isinstance(user_message, str) else (
@@ -145,9 +135,21 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
     if memory_context:
         system_content = system_content + "\n\n" + memory_context
 
-    messages = [{"role": "system", "content": system_content}] + clean_history
+    messages =[{"role": "system", "content": system_content}] + clean_history
     
-    client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=get_config("OPENROUTER_API_KEY"))
+    proxy_url = get_config("PROXY_URL") or None
+    http_client = None
+    if proxy_url:
+        try:
+            http_client = httpx.AsyncClient(proxy=proxy_url)
+        except TypeError:
+            http_client = httpx.AsyncClient(proxies=proxy_url)
+
+    client = AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1", 
+        api_key=get_config("OPENROUTER_API_KEY"),
+        http_client=http_client
+    )
 
     async def _tg_stream(text):
         if tg_update_callback: await tg_update_callback(text, False)
@@ -171,8 +173,8 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
         {"type": "function", "function": {"name": "send_file", "description": "Отправить файл/картинку пользователю в Telegram/GUI.", "parameters": {"type": "object", "properties": {"filepath": {"type": "string"}, "caption": {"type": "string"}}, "required":["filepath"]}}},
         {"type": "function", "function": {"name": "memory_operation", "description": "Ассоциативная память.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum":["save", "search", "forget"]}, "topic": {"type": "string"}, "content": {"type": "string"}, "query": {"type": "string"}}, "required":["action"]}}},
         {"type": "function", "function": {"name": "send_telegram_message", "description": "Инициировать сообщение в Telegram.", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required":["text"]}}},
-        {"type": "function", "function": {"name": "analyze_screenshot", "description": "Анализ скриншота.", "parameters": {"type": "object", "properties": {"image_path": {"type": "string"}, "prompt": {"type": "string"}, "use_grid": {"type": "boolean"}}, "required": ["image_path", "prompt"]}}},
-        {"type": "function", "function": {"name": "click_mouse", "description": "Клик мышью по координатам.", "parameters": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "button": {"type": "string"}}, "required": ["x", "y"]}}},
+        {"type": "function", "function": {"name": "analyze_screenshot", "description": "Анализ скриншота.", "parameters": {"type": "object", "properties": {"image_path": {"type": "string"}, "prompt": {"type": "string"}, "use_grid": {"type": "boolean"}}, "required":["image_path", "prompt"]}}},
+        {"type": "function", "function": {"name": "click_mouse", "description": "Клик мышью по координатам.", "parameters": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "button": {"type": "string"}}, "required":["x", "y"]}}},
         {"type": "function", "function": {"name": "type_text", "description": "Ввести текст с клавиатуры.", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}},
         {"type": "function", "function": {"name": "press_key", "description": "Нажать 1 клавишу (enter, tab, win).", "parameters": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}}},
         {"type": "function", "function": {"name": "hotkey", "description": "Горячая клавиша (['alt', 'tab']).", "parameters": {"type": "object", "properties": {"keys": {"type": "array", "items": {"type": "string"}}}, "required": ["keys"]}}},
@@ -283,7 +285,6 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
             db.add_to_history(user_id, tool_msg)
             messages.append(tool_msg)
 
-            # Статус только в UI, не в историю БД
             analyzing_msg = f"{thought}\n\n⏳ Анализирую результат..." if thought else "⏳ Анализирую результат..."
             _gui_status(analyzing_msg)
             await _tg_stream(analyzing_msg)
