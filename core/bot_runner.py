@@ -7,10 +7,11 @@ import interfaces.telegram_app as telegram_app
 import core.agent as agent
 
 async def start_bot(bot_provided=None):
-    """Единая точка запуска асинхронных задач бота (Telegram Polling + Фоновые таски)."""
+    """Единая точка запуска асинхронных задач бота (Telegram Polling + Фоновые таски).
+    Вызывается каждый раз в новом event loop — Bot и Dispatcher пересоздаются."""
     token = get_config("TELEGRAM_TOKEN").strip()
     proxy = get_config("PROXY_URL").strip()
-    
+
     if bot_provided is None:
         session = AiohttpSession(proxy=proxy) if proxy else None
         try:
@@ -20,6 +21,8 @@ async def start_bot(bot_provided=None):
             bot = None
     else:
         bot = bot_provided
+
+    dp = telegram_app.make_dispatcher()
 
     bg_autostart = get_config("bg_autostart")
 
@@ -31,14 +34,14 @@ async def start_bot(bot_provided=None):
         else:
             logging.info(f"💤 Фоновая активность отключена — первое пробуждение через {interval // 3600}ч {(interval % 3600) // 60}м.")
             await asyncio.sleep(interval)
-            
+
         while True:
             logging.info("🌅 Фоновое пробуждение агента — начало...")
             t_start = asyncio.get_event_loop().time()
             await agent.run_agent("GUI_USER", "[СИСТЕМА: ФОНОВОЕ ПРОБУЖДЕНИЕ. Проверь логи, задачи, процессы. Подумай, что бы ты хотел сделать?]", is_background=True, bot_instance=bot)
             elapsed = asyncio.get_event_loop().time() - t_start
             logging.info(f"✅ Фоновое пробуждение завершено за {elapsed:.1f}с.")
-            
+
             interval = get_config("bg_interval") or 28800
             logging.info(f"💤 Следующее пробуждение через {interval // 3600}ч {(interval % 3600) // 60}м.")
             await asyncio.sleep(interval)
@@ -48,7 +51,7 @@ async def start_bot(bot_provided=None):
     if bot is not None:
         await telegram_app.setup_bot_commands(bot)
         logging.info("✅ Telegram-клиент успешно запущен.")
-        await telegram_app.dp.start_polling(bot, handle_signals=False)
+        await dp.start_polling(bot, handle_signals=False)
     else:
         logging.info("✅ Агент запущен (режим работы без Telegram).")
         while True:

@@ -10,3 +10,4 @@ psutil
 pyautogui
 pynput
 pyperclip
+cryptography

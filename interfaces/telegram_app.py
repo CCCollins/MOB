@@ -40,9 +40,7 @@ def check_autostart() -> bool:
             return json.load(f).get("autostart", False)
     except Exception: return False
 
-dp = Dispatcher()
-
-BOT_COMMANDS =[
+BOT_COMMANDS = [
     BotCommand(command="memorize",   description="Сохранить факты в память"),
     BotCommand(command="screenshot", description="Отправить скриншот системы"),
     BotCommand(command="clear",      description="Сбросить краткосрочную память"),
@@ -69,7 +67,7 @@ async def setup_bot_commands(bot: Bot):
 
 def _safe_markdown(text: str) -> str:
     text = re.sub(r'\*\*(.+?)\*\*', r'*\1*', text, flags=re.DOTALL)
-    lines =[]
+    lines = []
     for line in text.split('\n'):
         if line.strip().startswith('`'):
             lines.append(line)
@@ -92,8 +90,6 @@ def get_tg_updater(message: types.Message, bot: Bot):
 
     async def tg_updater(text, is_final=False):
         md = _safe_markdown(text)
-        
-        # Попытка отправить/обновить через Markdown
         try:
             if streaming_msg_id[0] is None:
                 sent = await bot.send_message(message.chat.id, md, parse_mode="Markdown", reply_to_message_id=reply_to)
@@ -102,9 +98,7 @@ def get_tg_updater(message: types.Message, bot: Bot):
                 await bot.edit_message_text(chat_id=message.chat.id, message_id=streaming_msg_id[0], text=md, parse_mode="Markdown")
             return
         except Exception:
-            pass # Если Markdown сломан из-за незакрытых тегов в потоке, переходим к fallback
-        
-        # Fallback (Обычный текст без парсинга)
+            pass
         try:
             if streaming_msg_id[0] is None:
                 sent = await bot.send_message(message.chat.id, text[:4096], reply_to_message_id=reply_to)
@@ -113,17 +107,17 @@ def get_tg_updater(message: types.Message, bot: Bot):
                 await bot.edit_message_text(chat_id=message.chat.id, message_id=streaming_msg_id[0], text=text[:4096])
         except Exception as e:
             logging.error(f"TG Error: {e}")
-            
+
     return tg_updater
 
-@dp.message(Command("memorize"))
+# ── Хендлеры (функции без привязки к конкретному dp) ─────────────────────────
+
 async def cmd_memorize(message: types.Message, bot: Bot):
     if not is_allowed(message.from_user.id): return
     await message.answer("🧠 Запущен анализ краткосрочной памяти...")
     prompt = "ПРИНУДИТЕЛЬНАЯ ИНСТРУКЦИЯ: Изучи наш последний диалог и сохрани факты..."
     await agent.run_agent(str(message.from_user.id), prompt, source_channel="Telegram", tg_update_callback=get_tg_updater(message, bot), bot_instance=bot)
 
-@dp.message(Command("screenshot"))
 async def cmd_screenshot(message: types.Message, bot: Bot):
     if not is_allowed(message.from_user.id): return
     status_msg = await message.answer("📸 Делаю скриншот...")
@@ -138,13 +132,11 @@ async def cmd_screenshot(message: types.Message, bot: Bot):
     except Exception as e:
         await message.answer(f"Не удалось отправить: {e}")
 
-@dp.message(Command("clear"))
 async def cmd_reset(message: types.Message):
     if not is_allowed(message.from_user.id): return
     db.clear_history(str(message.from_user.id))
     await message.answer("🧹 История сессии очищена.")
 
-@dp.message(Command("restart"))
 async def cmd_restart(message: types.Message, bot: Bot):
     if not is_allowed(message.from_user.id): return
     logging.warning("🔄 Получена команда /restart — перезапускаю процесс...")
@@ -155,7 +147,6 @@ async def cmd_restart(message: types.Message, bot: Bot):
     except Exception: pass
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-@dp.message(Command("shutdown"))
 async def cmd_shutdown(message: types.Message, bot: Bot):
     if not is_allowed(message.from_user.id): return
     logging.warning("⏻ Получена команда /shutdown — выключаю процесс...")
@@ -165,12 +156,10 @@ async def cmd_shutdown(message: types.Message, bot: Bot):
     except Exception: pass
     os._exit(0)
 
-@dp.message(F.text)
 async def handle_text(message: types.Message, bot: Bot):
     if not is_allowed(message.from_user.id): return
     await agent.run_agent(str(message.from_user.id), message.text, source_channel="Telegram", tg_update_callback=get_tg_updater(message, bot), bot_instance=bot)
 
-@dp.message(F.photo | F.document)
 async def handle_files(message: types.Message, bot: Bot):
     if not is_allowed(message.from_user.id): return
 
@@ -184,7 +173,7 @@ async def handle_files(message: types.Message, bot: Bot):
 
     caption_text = message.caption or "Опиши файл"
     ext = orig_name.lower().split('.')[-1]
-    content =[{"type": "text", "text": caption_text}]
+    content = [{"type": "text", "text": caption_text}]
 
     if ext in ('docx', 'doc', 'xlsx', 'xls'):
         pdf_path = await tools.convert_to_pdf(tmp_path, orig_name)
@@ -201,3 +190,16 @@ async def handle_files(message: types.Message, bot: Bot):
         content[0]["text"] += f"\nФайл '{orig_name}' сохранён по пути: {tmp_path}\nДля чтения текстового файла используй file_operation(read)."
 
     await agent.run_agent(str(message.from_user.id), content, source_channel="Telegram", tg_update_callback=get_tg_updater(message, bot), bot_instance=bot)
+
+def make_dispatcher() -> Dispatcher:
+    """Создаёт свежий Dispatcher с зарегистрированными хендлерами.
+    Вызывается при каждом запуске агента, чтобы не было привязки к старому event loop."""
+    new_dp = Dispatcher()
+    new_dp.message.register(cmd_memorize,   Command("memorize"))
+    new_dp.message.register(cmd_screenshot, Command("screenshot"))
+    new_dp.message.register(cmd_reset,      Command("clear"))
+    new_dp.message.register(cmd_restart,    Command("restart"))
+    new_dp.message.register(cmd_shutdown,   Command("shutdown"))
+    new_dp.message.register(handle_text,    F.text)
+    new_dp.message.register(handle_files,   F.photo | F.document)
+    return new_dp

@@ -21,6 +21,12 @@ log = logging.getLogger("Agent")
 active_sessions: dict[str, asyncio.Queue] = {}
 user_locks: dict[str, asyncio.Lock] = {}
 
+def reset_session_state():
+    """Вызывается при старте нового event loop — очищает Lock/Queue,
+    привязанные к старому loop, чтобы избежать 'bound to a different event loop'."""
+    active_sessions.clear()
+    user_locks.clear()
+
 def get_system_prompt(source_channel: str) -> str:
     os_name = platform.system()
     if os_name == "Darwin": os_name = "macOS"
@@ -62,7 +68,21 @@ def get_system_prompt(source_channel: str) -> str:
 
 async def run_agent(user_id: str, user_message, source_channel="GUI", is_background=False, tg_update_callback=None, gui_stream_callback=None, bot_instance=None) -> bool:
     user_id = str(user_id)
-    if user_id not in user_locks: user_locks[user_id] = asyncio.Lock()
+
+    # Пересоздаём Lock/Queue если они привязаны к старому (закрытому) event loop
+    if user_id in user_locks:
+        try:
+            current_loop = asyncio.get_running_loop()
+            lk_loop = getattr(user_locks[user_id], '_loop', None)
+            if lk_loop is not None and lk_loop is not current_loop:
+                user_locks.pop(user_id, None)
+                active_sessions.pop(user_id, None)
+        except Exception:
+            user_locks.pop(user_id, None)
+            active_sessions.pop(user_id, None)
+
+    if user_id not in user_locks:
+        user_locks[user_id] = asyncio.Lock()
         
     if user_locks[user_id].locked():
         if user_id in active_sessions: active_sessions[user_id].put_nowait(user_message)
@@ -81,45 +101,48 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
     if user_message: db.add_to_history(user_id, {"role": "user", "content": user_message})
 
     def _sanitize_messages(msgs):
-        result =[]
-        i = 0
-        while i < len(msgs):
-            msg = msgs[i]
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                j = i + 1
-                while j < len(msgs) and msgs[j].get("role") == "system":
-                    j += 1
-                has_results = j < len(msgs) and msgs[j].get("role") == "tool"
+        """
+        Удаляет только «висячие» assistant-сообщения с tool_calls, у которых нет
+        соответствующих tool-результатов. Все остальные сообщения сохраняются.
+        """
+        # Собираем id всех tool_call_id из tool-сообщений
+        answered_ids = set()
+        for msg in msgs:
+            if msg.get("role") == "tool" and msg.get("tool_call_id"):
+                answered_ids.add(msg["tool_call_id"])
 
-                if not has_results:
-                    if result and result[-1].get("role") == "user":
-                        result.pop()
-                    i += 1
-                    while i < len(msgs) and msgs[i].get("role") == "system":
-                        i += 1
-                else:
-                    result.append(msg)
-                    i += 1
-                    while i < len(msgs) and msgs[i].get("role") == "system":
-                        i += 1
-                    while i < len(msgs) and msgs[i].get("role") == "tool":
-                        result.append(msgs[i])
-                        i += 1
-            elif msg.get("role") == "tool":
-                i += 1
-            else:
-                result.append(msg)
-                i += 1
-        return result
+        result = []
+        for msg in msgs:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                # Проверяем, есть ли ответ хотя бы на один tool_call
+                call_ids = [tc.get("id") for tc in msg["tool_calls"] if tc.get("id")]
+                if call_ids and not any(cid in answered_ids for cid in call_ids):
+                    # Висячий tool_call — пропускаем assistant-сообщение
+                    # и следом идущие tool-сообщения (их всё равно нет, но на всякий случай)
+                    continue
+            result.append(msg)
+
+        assistant_call_ids = set()
+        for msg in result:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    if tc.get("id"):
+                        assistant_call_ids.add(tc["id"])
+
+        final = []
+        for msg in result:
+            if msg.get("role") == "tool" and msg.get("tool_call_id") not in assistant_call_ids:
+                continue
+            final.append(msg)
+
+        return final
 
     raw_history = db.get_history(user_id)
     clean_history = _sanitize_messages(raw_history)
 
     if len(clean_history) != len(raw_history):
-        logging.warning(f"[Agent] История пользователя {user_id} содержала битые записи. Перезаписываю БД.")
-        db.clear_history(user_id)
-        for msg in clean_history:
-            db.add_to_history(user_id, msg)
+        removed = len(raw_history) - len(clean_history)
+        logging.warning(f"[Agent] История {user_id}: найдено {removed} висячих tool_call записей, они исключены из контекста запроса (БД не изменяется).")
 
     memory_context = ""
     if user_message:
@@ -182,13 +205,19 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
     ]
 
     max_iter = int(get_config("max_iterations") or 10)
-    for iteration in range(max_iter):
+    keep_chain = bool(get_config("keep_chain"))
+    chain_thoughts: list[str] = []   # накопленные рассуждения при keep_chain=True
 
-        while not active_sessions[user_id].empty():
-            new_msg = active_sessions[user_id].get_nowait()
-            intr_msg = {"role": "user", "content": f"[СРОЧНОЕ УТОЧНЕНИЕ ПОЛЬЗОВАТЕЛЯ]: {new_msg}"} if isinstance(new_msg, str) else {"role": "user", "content":[{"type": "text", "text": f"[СРОЧНОЕ УТОЧНЕНИЕ]: {new_msg[0]['text']}"}, new_msg[1]]}
-            messages.append(intr_msg)
-            db.add_to_history(user_id, intr_msg)
+    def _format_chain(current_status: str = "") -> str:
+        """Собирает все прошлые мысли + текущий статус в одно сообщение."""
+        parts = []
+        for i, t in enumerate(chain_thoughts, 1):
+            parts.append(f"**Шаг {i}:** {t}")
+        if current_status:
+            parts.append(current_status)
+        return "\n\n".join(parts)
+
+    for iteration in range(max_iter):
 
         full_text, tool_calls_dict, last_edit = "", {}, 0
         try:
@@ -222,9 +251,24 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
         db.add_to_history(user_id, msg_to_save)
         messages.append(msg_to_save)
 
+        while not active_sessions[user_id].empty():
+            new_msg = active_sessions[user_id].get_nowait()
+            intr_msg = (
+                {"role": "user", "content": f"[СРОЧНОЕ УТОЧНЕНИЕ ПОЛЬЗОВАТЕЛЯ]: {new_msg}"}
+                if isinstance(new_msg, str)
+                else {"role": "user", "content": [
+                    {"type": "text", "text": f"[СРОЧНОЕ УТОЧНЕНИЕ]: {new_msg[0]['text']}"},
+                    new_msg[1]
+                ]}
+            )
+            messages.append(intr_msg)
+            db.add_to_history(user_id, intr_msg)
+
         if not tool_calls:
             if not active_sessions[user_id].empty(): continue
             final_ans = full_text.strip() if full_text.strip() else "✅ Задача завершена."
+            if keep_chain and chain_thoughts:
+                final_ans = _format_chain(f"**Итог:** {final_ans}")
             await _tg_final(final_ans)
             _gui_final(final_ans)
             return
@@ -235,9 +279,14 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
             f_name = tc["function"]["name"]
             try: args = json.loads(tc["function"]["arguments"])
             except: args = {}
-            
+
             status_msg = f"🛠 **Выполняю:** `{f_name}`\n`{str(args)[:50]}...`"
-            combined_msg = f"{thought}\n\n{status_msg}" if thought else status_msg
+            if keep_chain:
+                if thought and (not chain_thoughts or chain_thoughts[-1] != thought):
+                    chain_thoughts.append(thought)
+                combined_msg = _format_chain(status_msg)
+            else:
+                combined_msg = f"{thought}\n\n{status_msg}" if thought else status_msg
             _gui_status(combined_msg)
             await _tg_stream(combined_msg)
             
@@ -286,9 +335,14 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
             messages.append(tool_msg)
 
             analyzing_msg = f"{thought}\n\n⏳ Анализирую результат..." if thought else "⏳ Анализирую результат..."
+            if keep_chain:
+                analyzing_msg = _format_chain("⏳ Анализирую результат...")
             _gui_status(analyzing_msg)
             await _tg_stream(analyzing_msg)
 
-    await _tg_final("⚠️ Достигнут лимит итераций задач.")
-    _gui_final("⚠️ Достигнут лимит итераций задач.")
+    final_limit = "⚠️ Достигнут лимит итераций задач."
+    if keep_chain and chain_thoughts:
+        final_limit = _format_chain(final_limit)
+    await _tg_final(final_limit)
+    _gui_final(final_limit)
     db.add_to_history(user_id, {"role": "system", "content": "[ПРЕРВАНО ПО ЛИМИТУ]"})

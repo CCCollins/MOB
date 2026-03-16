@@ -175,7 +175,10 @@ class AgentGUI(ctk.CTk):
         _label(row_limits, "Логи:").pack(side="left", padx=(0, 5))
         self.c_log = ctk.CTkComboBox(row_limits, values=["DEBUG", "INFO", "WARNING", "ERROR"], width=100, font=F)
         self.c_log.set(config.get_config("log_level") or "INFO")
-        self.c_log.pack(side="left", padx=(0, 10))
+        self.c_log.pack(side="left", padx=(0, 15))
+
+        self._keep_chain_var = tk.BooleanVar(value=bool(config.get_config("keep_chain")))
+        ctk.CTkCheckBox(row_limits, text="Цепочка рассуждений", variable=self._keep_chain_var, font=F).pack(side="left")
         current_row += 1
 
         # -- Блок Фона --
@@ -202,8 +205,19 @@ class AgentGUI(ctk.CTk):
         ctk.CTkButton(tab, text="📂", width=40, font=F, fg_color="#555", hover_color="#777", command=_browse_work_dir).grid(row=current_row, column=2, padx=10, pady=5)
         current_row += 1
 
-        btn_save = ctk.CTkButton(tab, text="💾 Сохранить", font=F_BOLD, command=self.save_configs)
-        btn_save.grid(row=current_row, column=0, columnspan=3, pady=20)
+        frame_actions = ctk.CTkFrame(tab, fg_color="transparent")
+        frame_actions.grid(row=current_row, column=0, columnspan=3, pady=(20, 16))
+        ctk.CTkButton(frame_actions, text="💾 Сохранить", font=F_BOLD, width=150,
+                      command=self.save_configs).pack(side="left", padx=6)
+        ctk.CTkButton(frame_actions, text="📤 Экспорт", font=F, width=120,
+                      fg_color="#3a5a3a", hover_color="#4a7a4a",
+                      command=self.export_config).pack(side="left", padx=6)
+        ctk.CTkButton(frame_actions, text="📥 Импорт", font=F, width=120,
+                      fg_color="#3a3a5a", hover_color="#4a4a7a",
+                      command=self.import_config).pack(side="left", padx=6)
+        ctk.CTkButton(frame_actions, text="🔴 Сброс", font=F, width=110,
+                      fg_color="#5a2a2a", hover_color="#7a3a3a",
+                      command=self.reset_configs).pack(side="left", padx=6)
 
     @staticmethod
     def _bind_entry(entry: ctk.CTkEntry):
@@ -259,12 +273,223 @@ class AgentGUI(ctk.CTk):
         try: data["history_limit"] = max(4, int(self.e_history_limit.get() or 40))
         except ValueError: data["history_limit"] = 40
         data["log_level"] = self.c_log.get()
+        data["keep_chain"] = self._keep_chain_var.get()
         data["model_main"] = self.e_model_main.get().strip()
         data["model_expert"] = self.e_model_expert.get().strip()
         data["work_dir"] = self.e_work_dir.get().strip()
         config.save_all(data)
         logging.getLogger().setLevel(data["log_level"])
         logging.info("Настройки сохранены.")
+
+    def reset_configs(self):
+        """Мгновенный сброс всех настроек к значениям по умолчанию без предупреждения."""
+        d = config.DEFAULT_CONFIG
+        config.save_all(d)
+
+        # Обновляем поля GUI
+        for key, entry in self.entries.items():
+            entry.delete(0, "end")
+            entry.insert(0, str(d.get(key, "")))
+
+        for attr, cfg_key in [
+            ("e_model_main", "model_main"), ("e_model_expert", "model_expert"), ("e_work_dir", "work_dir")
+        ]:
+            w = getattr(self, attr); w.delete(0, "end"); w.insert(0, str(d.get(cfg_key, "")))
+
+        t = int(d.get("bg_interval", 28800))
+        for attr, val in [("e_bg_h", t // 3600), ("e_bg_m", (t % 3600) // 60), ("e_bg_s", t % 60)]:
+            w = getattr(self, attr); w.delete(0, "end"); w.insert(0, str(val))
+
+        self._bg_autostart_var.set(bool(d.get("bg_autostart", False)))
+        self._keep_chain_var.set(bool(d.get("keep_chain", False)))
+        self.e_max_iter.delete(0, "end"); self.e_max_iter.insert(0, str(d.get("max_iterations", 10)))
+        self.e_history_limit.delete(0, "end"); self.e_history_limit.insert(0, str(d.get("history_limit", 40)))
+        self.c_log.set(d.get("log_level", "INFO"))
+
+        logging.info("🔴 Настройки сброшены к значениям по умолчанию.")
+
+    # ── Экспорт / Импорт ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ask_password(title: str, confirm: bool = False) -> str | None:
+        """Модальный диалог ввода пароля. Возвращает пароль или None если отмена."""
+        dlg = ctk.CTkToplevel()
+        dlg.title(title)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.lift()
+        dlg.focus_force()
+        dlg.geometry("380x" + ("200" if confirm else "160"))
+
+        result = [None]
+
+        ctk.CTkLabel(dlg, text="Пароль для шифрования:", font=("Segoe UI", 13)).pack(pady=(18, 4))
+        e1 = ctk.CTkEntry(dlg, show="*", width=280, font=("Segoe UI", 13))
+        e1.pack(pady=4)
+        e1.focus()
+
+        e2 = None
+        if confirm:
+            ctk.CTkLabel(dlg, text="Подтвердите пароль:", font=("Segoe UI", 13)).pack(pady=(6, 4))
+            e2 = ctk.CTkEntry(dlg, show="*", width=280, font=("Segoe UI", 13))
+            e2.pack(pady=4)
+
+        err_lbl = ctk.CTkLabel(dlg, text="", font=("Segoe UI", 11), text_color="#ff6060")
+        err_lbl.pack()
+
+        def _ok(event=None):
+            pwd = e1.get()
+            if not pwd:
+                err_lbl.configure(text="Пароль не может быть пустым.")
+                return
+            if confirm and e2 and e2.get() != pwd:
+                err_lbl.configure(text="Пароли не совпадают.")
+                return
+            result[0] = pwd
+            dlg.destroy()
+
+        def _cancel(event=None):
+            dlg.destroy()
+
+        btn_frame = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_frame.pack(pady=8)
+        ctk.CTkButton(btn_frame, text="✓ OK", width=100, command=_ok).pack(side="left", padx=8)
+        ctk.CTkButton(btn_frame, text="✕ Отмена", width=100, fg_color="#3a3a3a", hover_color="#550000", command=_cancel).pack(side="left", padx=8)
+        e1.bind("<Return>", _ok)
+        if e2: e2.bind("<Return>", _ok)
+        dlg.bind("<Escape>", _cancel)
+        dlg.wait_window()
+        return result[0]
+
+    @staticmethod
+    def _derive_key(password: str, salt: bytes) -> bytes:
+        """PBKDF2-HMAC-SHA256, 600 000 итераций → 32 байта для Fernet (urlsafe-base64)."""
+        import hashlib, base64 as _b64
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations=600_000, dklen=32)
+        return _b64.urlsafe_b64encode(dk)
+
+    def export_config(self):
+        """Сохраняет текущие настройки в зашифрованный .mobcfg файл."""
+        try:
+            from cryptography.fernet import Fernet
+        except ImportError:
+            import tkinter.messagebox as mb
+            mb.showerror("Ошибка", "Установите пакет cryptography:\npip install cryptography")
+            return
+
+        password = self._ask_password("Экспорт настроек", confirm=True)
+        if not password:
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Сохранить файл настроек",
+            defaultextension=".mobcfg",
+            filetypes=[("MOB Config", "*.mobcfg"), ("Все файлы", "*.*")]
+        )
+        if not path:
+            return
+
+        try:
+            import json as _json
+            # Читаем конфиг через settings — он сам расшифрует машинным ключом
+            raw = _json.dumps(config._read_raw(), indent=4, ensure_ascii=False)
+
+            salt = os.urandom(32)
+            key = self._derive_key(password, salt)
+            token = Fernet(key).encrypt(raw.encode("utf-8"))
+
+            magic = b"MOB\x01"
+            with open(path, "wb") as f:
+                f.write(magic + salt + token)
+
+            logging.info(f"✅ Настройки экспортированы: {path}")
+            import tkinter.messagebox as mb
+            mb.showinfo("Экспорт", f"Настройки успешно экспортированы:\n{path}")
+        except Exception as e:
+            import tkinter.messagebox as mb
+            mb.showerror("Ошибка экспорта", str(e))
+            logging.error(f"Ошибка экспорта настроек: {e}")
+
+    def import_config(self):
+        """Загружает и расшифровывает настройки из .mobcfg файла."""
+        try:
+            from cryptography.fernet import Fernet, InvalidToken
+        except ImportError:
+            import tkinter.messagebox as mb
+            mb.showerror("Ошибка", "Установите пакет cryptography:\npip install cryptography")
+            return
+
+        path = filedialog.askopenfilename(
+            title="Открыть файл настроек",
+            filetypes=[("MOB Config", "*.mobcfg"), ("Все файлы", "*.*")]
+        )
+        if not path:
+            return
+
+        password = self._ask_password("Импорт настроек", confirm=False)
+        if not password:
+            return
+
+        try:
+            import json as _json
+            with open(path, "rb") as f:
+                data = f.read()
+
+            magic = b"MOB\x01"
+            if not data.startswith(magic):
+                raise ValueError("Файл не является корректным MOB-конфигом.")
+
+            salt = data[4:36]
+            token = data[36:]
+            key = self._derive_key(password, salt)
+
+            try:
+                decrypted = Fernet(key).decrypt(token).decode("utf-8")
+            except InvalidToken:
+                import tkinter.messagebox as mb
+                mb.showerror("Ошибка импорта", "Неверный пароль или файл повреждён.")
+                return
+
+            cfg = _json.loads(decrypted)
+            config.save_all(cfg)
+
+            # Обновляем поля GUI
+            for key_name, entry in self.entries.items():
+                if key_name in cfg:
+                    entry.delete(0, "end")
+                    entry.insert(0, str(cfg[key_name]))
+
+            for attr, cfg_key in [
+                ("e_model_main", "model_main"), ("e_model_expert", "model_expert"),
+                ("e_work_dir", "work_dir"),
+            ]:
+                if cfg_key in cfg:
+                    w = getattr(self, attr)
+                    w.delete(0, "end")
+                    w.insert(0, str(cfg[cfg_key]))
+
+            if "bg_interval" in cfg:
+                t = int(cfg["bg_interval"])
+                for attr, val in [("e_bg_h", t // 3600), ("e_bg_m", (t % 3600) // 60), ("e_bg_s", t % 60)]:
+                    w = getattr(self, attr); w.delete(0, "end"); w.insert(0, str(val))
+            if "bg_autostart" in cfg:
+                self._bg_autostart_var.set(bool(cfg["bg_autostart"]))
+            if "keep_chain" in cfg:
+                self._keep_chain_var.set(bool(cfg["keep_chain"]))
+            if "max_iterations" in cfg:
+                self.e_max_iter.delete(0, "end"); self.e_max_iter.insert(0, str(cfg["max_iterations"]))
+            if "history_limit" in cfg:
+                self.e_history_limit.delete(0, "end"); self.e_history_limit.insert(0, str(cfg["history_limit"]))
+            if "log_level" in cfg:
+                self.c_log.set(cfg["log_level"])
+
+            logging.info(f"✅ Настройки импортированы из: {path}")
+            import tkinter.messagebox as mb
+            mb.showinfo("Импорт", "Настройки успешно импортированы и применены!")
+        except Exception as e:
+            import tkinter.messagebox as mb
+            mb.showerror("Ошибка импорта", str(e))
+            logging.error(f"Ошибка импорта настроек: {e}")
 
     def setup_chat_tab(self):
         tab = self.tabview.tab("Чат")
@@ -289,11 +514,12 @@ class AgentGUI(ctk.CTk):
                     self.msg_entry.delete("1.0", "end"); self.msg_entry.insert("1.0", f"/{c}"); self.msg_entry.focus(); self.after(50, self.send_gui_msg)
                 menu.add_command(label=f"/{cmd.command}  —  {cmd.description}", command=_run_cmd)
             
-            def _popup():
-                try: menu.tk_popup(self._cmd_menu_btn.winfo_rootx(), self._cmd_menu_btn.winfo_rooty() - menu.winfo_reqheight() - 4)
-                finally: menu.grab_release()
-            
-            self.after(150, _popup)
+            try:
+                x = self._cmd_menu_btn.winfo_rootx()
+                y = self._cmd_menu_btn.winfo_rooty() - menu.winfo_reqheight() - 4
+                menu.tk_popup(x, y)
+            finally:
+                menu.grab_release()
 
         self._cmd_menu_btn = _make_icon_btn(icon_frame, "☰", _show_commands_menu, "Команды")
         _make_icon_btn(icon_frame, "📎", self.send_file_gui, "Прикрепить файл")
@@ -303,6 +529,64 @@ class AgentGUI(ctk.CTk):
         self.msg_entry.pack(side="left", fill="x", expand=True, padx=(0, 4), pady=2)
         self._hide_scrollbar(self.msg_entry)
         self.msg_entry._textbox.configure(undo=True, maxundo=-1)
+
+        def _msg_entry_ctrl(event):
+            k = event.keycode
+            inner = self.msg_entry._textbox
+            # C=54, V=55, X=53, A=38, Z=52 (Linux keycodes)
+            if k == 54:   # Ctrl+C — копировать
+                try: self.clipboard_clear(); self.clipboard_append(inner.selection_get())
+                except Exception: pass
+                return "break"
+            if k == 55:   # Ctrl+V — вставить
+                try:
+                    text_to_paste = self.clipboard_get()
+                    try: inner.delete("sel.first", "sel.last")
+                    except Exception: pass
+                    inner.insert("insert", text_to_paste)
+                except Exception: pass
+                return "break"
+            if k == 53:   # Ctrl+X — вырезать
+                try:
+                    sel = inner.selection_get()
+                    self.clipboard_clear(); self.clipboard_append(sel)
+                    inner.delete("sel.first", "sel.last")
+                except Exception: pass
+                return "break"
+            if k == 38:   # Ctrl+A — выделить всё
+                inner.tag_add("sel", "1.0", "end")
+                return "break"
+            if k == 52:   # Ctrl+Z — отменить
+                try: inner.edit_undo()
+                except Exception: pass
+                return "break"
+
+        def _msg_entry_ctrl_backspace(event):
+            """Ctrl+Backspace — удалить слово влево."""
+            inner = self.msg_entry._textbox
+            # Удаляем выделение если есть, иначе слово влево
+            try:
+                inner.delete("sel.first", "sel.last")
+                return "break"
+            except Exception:
+                pass
+            inner.tk.call(inner, "delete", "insert-1c wordstart", "insert")
+            return "break"
+
+        def _msg_entry_ctrl_delete(event):
+            """Ctrl+Delete — удалить слово вправо."""
+            inner = self.msg_entry._textbox
+            try:
+                inner.delete("sel.first", "sel.last")
+                return "break"
+            except Exception:
+                pass
+            inner.tk.call(inner, "delete", "insert", "insert+1c wordend")
+            return "break"
+
+        self.msg_entry._textbox.bind("<Control-KeyPress>", _msg_entry_ctrl)
+        self.msg_entry._textbox.bind("<Control-BackSpace>", _msg_entry_ctrl_backspace)
+        self.msg_entry._textbox.bind("<Control-Delete>", _msg_entry_ctrl_delete)
 
         def _resize_entry(e=None):
             lines = int(self.msg_entry._textbox.index("end-1c").split(".")[0])
@@ -331,25 +615,34 @@ class AgentGUI(ctk.CTk):
                 break
 
     def attach_copy_bindings(self, textbox):
-        def copy_text(event=None):
-            if event and event.char != '\x03': return
-            try:
-                self.clipboard_clear()
-                self.clipboard_append(textbox.selection_get())
-            except Exception: pass
-            return "break"
+        # Используем keycode вместо event.char — работает при любой раскладке (включая русскую)
+        def _on_ctrl(event=None):
+            k = event.keycode if event else 0
+            # C = 54 (Linux/Win), 8 (Mac) — копировать
+            if k in (54, 67):
+                try:
+                    self.clipboard_clear()
+                    self.clipboard_append(textbox._textbox.selection_get())
+                except Exception: pass
+                return "break"
+            # A = 38 (Linux/Win), 0 (Mac) — выделить всё
+            if k in (38, 65):
+                try: textbox._textbox.tag_add("sel", "1.0", "end")
+                except Exception: pass
+                return "break"
+            # Всё остальное — не перехватываем
 
-        textbox.bind("<Control-KeyPress>", copy_text)
-        textbox.bind("<Command-KeyPress>", copy_text)
+        textbox.bind("<Control-KeyPress>", _on_ctrl)
+        textbox.bind("<Command-KeyPress>", _on_ctrl)
 
         menu = tk.Menu(self, tearoff=0, bg="#2b2b2b", fg="white", activebackground="#1f538d", activeforeground="white", borderwidth=0)
-        menu.add_command(label="Копировать", command=copy_text)
+        menu.add_command(label="Копировать", command=lambda: _on_ctrl(type('E', (), {'keycode': 54})()))
 
         def show_menu(event):
-            def _popup():
-                try: menu.tk_popup(event.x_root, event.y_root)
-                finally: menu.grab_release()
-            self.after(150, _popup)
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
 
         if platform.system() == "Darwin":
             textbox.bind("<Button-2>", show_menu)
@@ -577,7 +870,7 @@ class AgentGUI(ctk.CTk):
 
     def send_gui_msg(self):
         msg = self.msg_entry.get("1.0", "end").strip()
-        if not msg or not self.is_running: return
+        if not msg: return
         self.msg_entry.delete("1.0", "end")
         
         if msg.startswith("/"):
@@ -615,9 +908,17 @@ class AgentGUI(ctk.CTk):
         self._dispatch_to_agent(msg)
 
     def _dispatch_to_agent(self, content):
+        if not self.async_loop or self.async_loop.is_closed():
+            self.append_chat("Система", "⚠️ Агент не запущен. Нажмите «Запустить Агента».", close_bubble=True)
+            return
         def stream_callback(text, is_status): self.after(0, self.append_chat, "Агент", text, isinstance(text, str), not is_status)
-        if "GUI_USER" in agent.active_sessions: agent.active_sessions["GUI_USER"].put_nowait(content); return
-        asyncio.run_coroutine_threadsafe(agent.run_agent("GUI_USER", content, source_channel="GUI", gui_stream_callback=stream_callback), self.async_loop)
+        if "GUI_USER" in agent.active_sessions:
+            agent.active_sessions["GUI_USER"].put_nowait(content)
+            return
+        asyncio.run_coroutine_threadsafe(
+            agent.run_agent("GUI_USER", content, source_channel="GUI", gui_stream_callback=stream_callback),
+            self.async_loop
+        )
 
     def send_file_gui(self):
         if not self.is_running: return
@@ -700,22 +1001,36 @@ class AgentGUI(ctk.CTk):
         if not self.is_running:
             self.btn_toggle.configure(text="Остановить Агента", fg_color="red")
             self.is_running = True
+            self.async_loop = None  # сброс перед созданием нового
             self.bot_thread = threading.Thread(target=self._run_async_bot_thread, daemon=True)
             self.bot_thread.start()
         else:
             self.btn_toggle.configure(text="Запустить Агента", fg_color="green")
             self.is_running = False
-            if self.async_loop: self.async_loop.call_soon_threadsafe(self.async_loop.stop)
+            if self.async_loop and not self.async_loop.is_closed():
+                self.async_loop.call_soon_threadsafe(self.async_loop.stop)
 
     def _run_async_bot_thread(self):
-        self.async_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.async_loop)
+        loop = asyncio.new_event_loop()
+        self.async_loop = loop
+        asyncio.set_event_loop(loop)
+        # Сбрасываем Lock/Queue от предыдущего loop во избежание "bound to a different event loop"
+        agent.reset_session_state()
         try:
-            self.async_loop.run_until_complete(start_bot())
+            loop.run_until_complete(start_bot())
         except asyncio.CancelledError: pass
         except Exception as e: logging.error(e)
         finally:
-            self.async_loop.close()
+            # Отменяем все pending-задачи перед закрытием
+            try:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception: pass
+            loop.close()
+            self.async_loop = None
             logging.info("🛑 Агент остановлен.")
 
     def force_quit(self):

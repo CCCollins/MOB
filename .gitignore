@@ -4,6 +4,7 @@
 /config/__pycache__
 /core/__pycache__
 /core/screenshots
+/data
 /dist
 /build
 /EXE
@@ -11,6 +12,4 @@
 *.db
 *.jpg
 *.txt
-*.spec
-*.iss
-*.exe
+*.mobcfg
