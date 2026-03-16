@@ -24,6 +24,30 @@ def resource_path(relative_path):
     except Exception: base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
+def _win_cyrillic_bind(inner, copy_fn, paste_fn, cut_fn, sel_fn, undo_fn, redo_fn=None):
+    """На Windows Ctrl+кириллица даёт keysym='??', ловим по keycode физической клавиши."""
+    if platform.system() != "Windows":
+        return
+    KEYCODE_MAP = {
+        67: copy_fn,   # C / С
+        86: paste_fn,  # V / М
+        88: cut_fn,    # X / Ч
+        65: sel_fn,    # A / Ф
+        90: undo_fn,   # Z / Я
+    }
+    def _handler(e):
+        if not (e.state & 0x4):  # Ctrl не зажат
+            return
+        if e.keysym not in ('??', '?'):  # латиница уже обработана стандартными биндингами
+            return
+        fn = KEYCODE_MAP.get(e.keycode)
+        if fn is None:
+            return
+        if e.keycode == 90 and redo_fn and (e.state & 0x1):  # Ctrl+Shift+Z → redo
+            return redo_fn()
+        return fn()
+    inner.bind("<KeyPress>", _handler, add="+")
+
 class GUILogHandler(logging.Handler):
     def __init__(self, textbox):
         super().__init__()
@@ -98,6 +122,7 @@ class AgentGUI(ctk.CTk):
             "OPENROUTER_API_KEY":   ("OpenRouter API Key",   "https://openrouter.ai/settings/keys"),
             "BRAVE_API_KEY":        ("Brave Search API Key", "https://api-dashboard.search.brave.com/app/keys"),
             "DYNAMICPDF_API_KEY":   ("DynamicPDF API Key",   "https://dpdf.io/"),
+            "CHECKO_API_KEY":       ("Checko API Key",       "https://checko.ru/integration/api"),
             "PROXY_URL":            ("Proxy (http://...)",   "https://proxy6.net/"),
         }
 
@@ -138,20 +163,35 @@ class AgentGUI(ctk.CTk):
                 btn.grid(row=current_row, column=2, padx=10, pady=5)
             current_row += 1
 
-        # -- Компактный блок Моделей --
-        _label(tab, "Модели (Main/Expert):").grid(row=current_row, column=0, padx=10, pady=5, sticky="w")
+        # -- Блок Моделей (Оркестратор / Чат / Эксперт) в один ряд --
+        _label(tab, "Роли и Модели ИИ:").grid(row=current_row, column=0, padx=10, pady=5, sticky="nw")
         row_models = ctk.CTkFrame(tab, fg_color="transparent")
-        row_models.grid(row=current_row, column=1, columnspan=2, sticky="we", padx=(10, 0), pady=5)
+        row_models.grid(row=current_row, column=1, columnspan=2, sticky="we", padx=(10, 10), pady=5)
         
-        self.e_model_main = ctk.CTkEntry(row_models, font=F)
-        self.e_model_main.insert(0, config.get_config("model_main"))
-        self.e_model_main.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self._bind_entry(self.e_model_main)
+        LBL_W = 40
         
-        _label(row_models, "").pack(side="left", padx=(0, 5))
-        self.e_model_expert = ctk.CTkEntry(row_models, font=F)
+        # 1. Оркестратор
+        lbl_orch = ctk.CTkLabel(row_models, text="Оркестр.:", font=F, width=LBL_W, anchor="e")
+        lbl_orch.pack(side="left", padx=(0, 5))
+        self.e_model_orchestrator = ctk.CTkEntry(row_models, font=F, width=50)
+        self.e_model_orchestrator.insert(0, config.get_config("model_orchestrator"))
+        self.e_model_orchestrator.pack(side="left", fill="x", expand=True, padx=(0, 15))
+        self._bind_entry(self.e_model_orchestrator)
+        
+        # 2. Чат
+        lbl_chat = ctk.CTkLabel(row_models, text="Чат:", font=F, width=LBL_W, anchor="e")
+        lbl_chat.pack(side="left", padx=(0, 5))
+        self.e_model_chat = ctk.CTkEntry(row_models, font=F, width=50)
+        self.e_model_chat.insert(0, config.get_config("model_chat"))
+        self.e_model_chat.pack(side="left", fill="x", expand=True, padx=(0, 15))
+        self._bind_entry(self.e_model_chat)
+        
+        # 3. Эксперт
+        lbl_exp = ctk.CTkLabel(row_models, text="Код:", font=F, width=LBL_W, anchor="e")
+        lbl_exp.pack(side="left", padx=(0, 5))
+        self.e_model_expert = ctk.CTkEntry(row_models, font=F, width=50)
         self.e_model_expert.insert(0, config.get_config("model_expert"))
-        self.e_model_expert.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.e_model_expert.pack(side="left", fill="x", expand=True, padx=(0, 0))
         self._bind_entry(self.e_model_expert)
         current_row += 1
 
@@ -220,46 +260,81 @@ class AgentGUI(ctk.CTk):
                       command=self.reset_configs).pack(side="left", padx=6)
 
     @staticmethod
-    def _bind_entry(entry: ctk.CTkEntry):
-        inner = entry._entry
-        undo_stack, redo_stack, _last_saved =[], [], [""]
+    def _make_undo_funcs(inner):
+        undo_stack, redo_stack, _last_saved = [], [], [""]
+
         def _snapshot():
             val = inner.get()
-            if val != _last_saved[0]: undo_stack.append((_last_saved[0], inner.index("insert"))); redo_stack.clear(); _last_saved[0] = val
+            if val != _last_saved[0]:
+                undo_stack.append((_last_saved[0], inner.index("insert")))
+                redo_stack.clear()
+                _last_saved[0] = val
+
         def _undo(e=None):
             _snapshot()
             if not undo_stack: return "break"
-            val, pos = undo_stack.pop(); redo_stack.append((inner.get(), inner.index("insert"))); _last_saved[0] = val; inner.delete(0, "end"); inner.insert(0, val)
+            val, pos = undo_stack.pop()
+            redo_stack.append((inner.get(), inner.index("insert")))
+            _last_saved[0] = val
+            inner.delete(0, "end"); inner.insert(0, val)
             try: inner.icursor(min(pos, len(val)))
             except: pass
             return "break"
+
         def _redo(e=None):
             if not redo_stack: return "break"
-            val, pos = redo_stack.pop(); undo_stack.append((inner.get(), inner.index("insert"))); _last_saved[0] = val; inner.delete(0, "end"); inner.insert(0, val)
+            val, pos = redo_stack.pop()
+            undo_stack.append((inner.get(), inner.index("insert")))
+            _last_saved[0] = val
+            inner.delete(0, "end"); inner.insert(0, val)
             try: inner.icursor(min(pos, len(val)))
             except: pass
             return "break"
-        def _on_ctrl(e):
-            k = e.keycode
-            if k == 65: inner.select_range(0, "end"); inner.icursor("end"); return "break"
-            if k == 67: 
-                try: inner.clipboard_clear(); inner.clipboard_append(inner.selection_get())
+
+        def _select_all(e=None):
+            inner.select_range(0, "end"); inner.icursor("end")
+            return "break"
+
+        def _copy(e=None):
+            try: inner.clipboard_clear(); inner.clipboard_append(inner.selection_get())
+            except: pass
+            return "break"
+
+        def _paste(e=None):
+            try:
+                _snapshot()
+                text = inner.clipboard_get()
+                try: inner.delete("sel.first", "sel.last")
                 except: pass
-                return "break"
-            if k == 86:
-                try: _snapshot(); text = inner.clipboard_get(); inner.delete("sel.first", "sel.last")
-                except: pass
-                try: inner.insert("insert", text)
-                except: pass
-                return "break"
-            if k == 88:
-                try: _snapshot(); sel = inner.selection_get(); inner.clipboard_clear(); inner.clipboard_append(sel); inner.delete("sel.first", "sel.last")
-                except: pass
-                return "break"
-            if k == 90: return _redo() if (e.state & 0x1) else _undo()
+                inner.insert("insert", text)
+            except: pass
+            return "break"
+
+        def _cut(e=None):
+            try:
+                _snapshot()
+                sel = inner.selection_get()
+                inner.clipboard_clear(); inner.clipboard_append(sel)
+                inner.delete("sel.first", "sel.last")
+            except: pass
+            return "break"
+
+        return _snapshot, _undo, _redo, _select_all, _copy, _paste, _cut
+
+    def _bind_entry(self, entry: ctk.CTkEntry):
+        inner = entry._entry
+        _snapshot, _undo, _redo, _sel, _copy, _paste, _cut = self._make_undo_funcs(inner)
+
         inner.bind("<KeyRelease>", lambda e: inner.after(10, _snapshot))
-        inner.bind("<Control-KeyPress>", _on_ctrl)
-        inner.bind("<Command-KeyPress>", _on_ctrl)
+
+        mod = "Command" if platform.system() == "Darwin" else "Control"
+        inner.bind(f"<{mod}-c>", _copy); inner.bind(f"<{mod}-C>", _copy)
+        inner.bind(f"<{mod}-v>", _paste); inner.bind(f"<{mod}-V>", _paste)
+        inner.bind(f"<{mod}-x>", _cut); inner.bind(f"<{mod}-X>", _cut)
+        inner.bind(f"<{mod}-a>", _sel); inner.bind(f"<{mod}-A>", _sel)
+        inner.bind(f"<{mod}-z>", _undo); inner.bind(f"<{mod}-Z>", _undo)
+        inner.bind(f"<{mod}-Shift-z>", _redo); inner.bind(f"<{mod}-Shift-Z>", _redo)
+        _win_cyrillic_bind(inner, _copy, _paste, _cut, _sel, _undo, _redo)
 
     def toggle_visibility(self, entry):
         entry.configure(show="" if entry.cget("show") == "*" else "*")
@@ -274,7 +349,8 @@ class AgentGUI(ctk.CTk):
         except ValueError: data["history_limit"] = 40
         data["log_level"] = self.c_log.get()
         data["keep_chain"] = self._keep_chain_var.get()
-        data["model_main"] = self.e_model_main.get().strip()
+        data["model_orchestrator"] = self.e_model_orchestrator.get().strip()
+        data["model_chat"] = self.e_model_chat.get().strip()
         data["model_expert"] = self.e_model_expert.get().strip()
         data["work_dir"] = self.e_work_dir.get().strip()
         config.save_all(data)
@@ -282,22 +358,23 @@ class AgentGUI(ctk.CTk):
         logging.info("Настройки сохранены.")
 
     def reset_configs(self):
-        """Мгновенный сброс всех настроек к значениям по умолчанию без предупреждения."""
         d = config.DEFAULT_CONFIG
         config.save_all(d)
 
-        # Обновляем поля GUI
         for key, entry in self.entries.items():
             entry.delete(0, "end")
             entry.insert(0, str(d.get(key, "")))
 
-        for attr, cfg_key in [
-            ("e_model_main", "model_main"), ("e_model_expert", "model_expert"), ("e_work_dir", "work_dir")
+        for attr, cfg_key in[
+            ("e_model_orchestrator", "model_orchestrator"), 
+            ("e_model_chat", "model_chat"), 
+            ("e_model_expert", "model_expert"),
+            ("e_work_dir", "work_dir"),
         ]:
             w = getattr(self, attr); w.delete(0, "end"); w.insert(0, str(d.get(cfg_key, "")))
 
         t = int(d.get("bg_interval", 28800))
-        for attr, val in [("e_bg_h", t // 3600), ("e_bg_m", (t % 3600) // 60), ("e_bg_s", t % 60)]:
+        for attr, val in[("e_bg_h", t // 3600), ("e_bg_m", (t % 3600) // 60), ("e_bg_s", t % 60)]:
             w = getattr(self, attr); w.delete(0, "end"); w.insert(0, str(val))
 
         self._bg_autostart_var.set(bool(d.get("bg_autostart", False)))
@@ -308,11 +385,8 @@ class AgentGUI(ctk.CTk):
 
         logging.info("🔴 Настройки сброшены к значениям по умолчанию.")
 
-    # ── Экспорт / Импорт ──────────────────────────────────────────────────────
-
     @staticmethod
     def _ask_password(title: str, confirm: bool = False) -> str | None:
-        """Модальный диалог ввода пароля. Возвращает пароль или None если отмена."""
         dlg = ctk.CTkToplevel()
         dlg.title(title)
         dlg.resizable(False, False)
@@ -363,13 +437,11 @@ class AgentGUI(ctk.CTk):
 
     @staticmethod
     def _derive_key(password: str, salt: bytes) -> bytes:
-        """PBKDF2-HMAC-SHA256, 600 000 итераций → 32 байта для Fernet (urlsafe-base64)."""
         import hashlib, base64 as _b64
         dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations=600_000, dklen=32)
         return _b64.urlsafe_b64encode(dk)
 
     def export_config(self):
-        """Сохраняет текущие настройки в зашифрованный .mobcfg файл."""
         try:
             from cryptography.fernet import Fernet
         except ImportError:
@@ -391,7 +463,6 @@ class AgentGUI(ctk.CTk):
 
         try:
             import json as _json
-            # Читаем конфиг через settings — он сам расшифрует машинным ключом
             raw = _json.dumps(config._read_raw(), indent=4, ensure_ascii=False)
 
             salt = os.urandom(32)
@@ -411,7 +482,6 @@ class AgentGUI(ctk.CTk):
             logging.error(f"Ошибка экспорта настроек: {e}")
 
     def import_config(self):
-        """Загружает и расшифровывает настройки из .mobcfg файла."""
         try:
             from cryptography.fernet import Fernet, InvalidToken
         except ImportError:
@@ -453,14 +523,15 @@ class AgentGUI(ctk.CTk):
             cfg = _json.loads(decrypted)
             config.save_all(cfg)
 
-            # Обновляем поля GUI
             for key_name, entry in self.entries.items():
                 if key_name in cfg:
                     entry.delete(0, "end")
                     entry.insert(0, str(cfg[key_name]))
 
-            for attr, cfg_key in [
-                ("e_model_main", "model_main"), ("e_model_expert", "model_expert"),
+            for attr, cfg_key in[
+                ("e_model_orchestrator", "model_orchestrator"), 
+                ("e_model_chat", "model_chat"), 
+                ("e_model_expert", "model_expert"),
                 ("e_work_dir", "work_dir"),
             ]:
                 if cfg_key in cfg:
@@ -470,7 +541,7 @@ class AgentGUI(ctk.CTk):
 
             if "bg_interval" in cfg:
                 t = int(cfg["bg_interval"])
-                for attr, val in [("e_bg_h", t // 3600), ("e_bg_m", (t % 3600) // 60), ("e_bg_s", t % 60)]:
+                for attr, val in[("e_bg_h", t // 3600), ("e_bg_m", (t % 3600) // 60), ("e_bg_s", t % 60)]:
                     w = getattr(self, attr); w.delete(0, "end"); w.insert(0, str(val))
             if "bg_autostart" in cfg:
                 self._bg_autostart_var.set(bool(cfg["bg_autostart"]))
@@ -514,12 +585,18 @@ class AgentGUI(ctk.CTk):
                     self.msg_entry.delete("1.0", "end"); self.msg_entry.insert("1.0", f"/{c}"); self.msg_entry.focus(); self.after(50, self.send_gui_msg)
                 menu.add_command(label=f"/{cmd.command}  —  {cmd.description}", command=_run_cmd)
             
-            try:
-                x = self._cmd_menu_btn.winfo_rootx()
-                y = self._cmd_menu_btn.winfo_rooty() - menu.winfo_reqheight() - 4
-                menu.tk_popup(x, y)
-            finally:
-                menu.grab_release()
+            items_count = len(telegram_app.BOT_COMMANDS)
+            est_height = items_count * 28 + 10
+            est_width = 300
+            
+            btn_x = self._cmd_menu_btn.winfo_rootx()
+            btn_y = self._cmd_menu_btn.winfo_rooty()
+            btn_w = self._cmd_menu_btn.winfo_width()
+            
+            x = btn_x - est_width + btn_w
+            y = btn_y - est_height
+            
+            menu.tk_popup(x, y)
 
         self._cmd_menu_btn = _make_icon_btn(icon_frame, "☰", _show_commands_menu, "Команды")
         _make_icon_btn(icon_frame, "📎", self.send_file_gui, "Прикрепить файл")
@@ -530,63 +607,72 @@ class AgentGUI(ctk.CTk):
         self._hide_scrollbar(self.msg_entry)
         self.msg_entry._textbox.configure(undo=True, maxundo=-1)
 
-        def _msg_entry_ctrl(event):
-            k = event.keycode
-            inner = self.msg_entry._textbox
-            # C=54, V=55, X=53, A=38, Z=52 (Linux keycodes)
-            if k == 54:   # Ctrl+C — копировать
-                try: self.clipboard_clear(); self.clipboard_append(inner.selection_get())
-                except Exception: pass
-                return "break"
-            if k == 55:   # Ctrl+V — вставить
-                try:
-                    text_to_paste = self.clipboard_get()
-                    try: inner.delete("sel.first", "sel.last")
-                    except Exception: pass
-                    inner.insert("insert", text_to_paste)
-                except Exception: pass
-                return "break"
-            if k == 53:   # Ctrl+X — вырезать
-                try:
-                    sel = inner.selection_get()
-                    self.clipboard_clear(); self.clipboard_append(sel)
-                    inner.delete("sel.first", "sel.last")
-                except Exception: pass
-                return "break"
-            if k == 38:   # Ctrl+A — выделить всё
-                inner.tag_add("sel", "1.0", "end")
-                return "break"
-            if k == 52:   # Ctrl+Z — отменить
-                try: inner.edit_undo()
-                except Exception: pass
-                return "break"
+        inner = self.msg_entry._textbox
 
-        def _msg_entry_ctrl_backspace(event):
-            """Ctrl+Backspace — удалить слово влево."""
-            inner = self.msg_entry._textbox
-            # Удаляем выделение если есть, иначе слово влево
+        def _on_copy(e=None):
+            try: 
+                self.clipboard_clear()
+                self.clipboard_append(inner.selection_get())
+            except Exception: pass
+            return "break"
+
+        def _on_paste(e=None):
+            try:
+                text_to_paste = self.clipboard_get()
+                try: inner.delete("sel.first", "sel.last")
+                except Exception: pass
+                inner.insert("insert", text_to_paste)
+            except Exception: pass
+            return "break"
+
+        def _on_cut(e=None):
+            try:
+                sel = inner.selection_get()
+                self.clipboard_clear()
+                self.clipboard_append(sel)
+                inner.delete("sel.first", "sel.last")
+            except Exception: pass
+            return "break"
+
+        def _on_select_all(e=None):
+            inner.tag_add("sel", "1.0", "end")
+            return "break"
+
+        def _on_undo(e=None):
+            try: inner.edit_undo()
+            except Exception: pass
+            return "break"
+
+        def _on_backspace(e=None):
             try:
                 inner.delete("sel.first", "sel.last")
                 return "break"
-            except Exception:
-                pass
-            inner.tk.call(inner, "delete", "insert-1c wordstart", "insert")
+            except Exception: pass
+            inner.delete("insert-1c wordstart", "insert")
             return "break"
 
-        def _msg_entry_ctrl_delete(event):
-            """Ctrl+Delete — удалить слово вправо."""
-            inner = self.msg_entry._textbox
+        def _on_delete(e=None):
             try:
                 inner.delete("sel.first", "sel.last")
                 return "break"
-            except Exception:
-                pass
-            inner.tk.call(inner, "delete", "insert", "insert+1c wordend")
+            except Exception: pass
+            inner.delete("insert", "insert wordend")
             return "break"
 
-        self.msg_entry._textbox.bind("<Control-KeyPress>", _msg_entry_ctrl)
-        self.msg_entry._textbox.bind("<Control-BackSpace>", _msg_entry_ctrl_backspace)
-        self.msg_entry._textbox.bind("<Control-Delete>", _msg_entry_ctrl_delete)
+        mod = "Command" if platform.system() == "Darwin" else "Control"
+        def safe_bind(seq, func):
+            try: inner.bind(seq, func)
+            except tk.TclError: pass
+
+        for k in['c', 'C', 'с', 'С', 'Cyrillic_es', 'cyrillic_es']: safe_bind(f"<{mod}-KeyPress-{k}>", _on_copy)
+        for k in['v', 'V', 'м', 'М', 'Cyrillic_em', 'cyrillic_em']: safe_bind(f"<{mod}-KeyPress-{k}>", _on_paste)
+        for k in['x', 'X', 'ч', 'Ч', 'Cyrillic_che', 'cyrillic_che']: safe_bind(f"<{mod}-KeyPress-{k}>", _on_cut)
+        for k in['a', 'A', 'ф', 'Ф', 'Cyrillic_ef', 'cyrillic_ef']: safe_bind(f"<{mod}-KeyPress-{k}>", _on_select_all)
+        for k in['z', 'Z', 'я', 'Я', 'Cyrillic_ya', 'cyrillic_ya']: safe_bind(f"<{mod}-KeyPress-{k}>", _on_undo)
+        _win_cyrillic_bind(inner, _on_copy, _on_paste, _on_cut, _on_select_all, _on_undo)
+        
+        safe_bind(f"<{mod}-BackSpace>", _on_backspace)
+        safe_bind(f"<{mod}-Delete>", _on_delete)
 
         def _resize_entry(e=None):
             lines = int(self.msg_entry._textbox.index("end-1c").split(".")[0])
@@ -594,7 +680,8 @@ class AgentGUI(ctk.CTk):
         
         def _entry_send(e):
             if e.state & 0x1: return
-            self.send_gui_msg(); return "break"
+            self.send_gui_msg()
+            return "break"
 
         self.msg_entry.bind("<Return>", _entry_send)
         self.msg_entry.bind("<KeyRelease>", _resize_entry)
@@ -606,7 +693,6 @@ class AgentGUI(ctk.CTk):
     COLOR_CODE = "#e6db74"
 
     def _hide_scrollbar(self, tb):
-        """Прячет вертикальный скроллбар CTkTextbox."""
         for _attr in ("_scrollbar", "_y_scrollbar", "_scrollbar_y"):
             _sb = getattr(tb, _attr, None)
             if _sb is not None:
@@ -615,34 +701,34 @@ class AgentGUI(ctk.CTk):
                 break
 
     def attach_copy_bindings(self, textbox):
-        # Используем keycode вместо event.char — работает при любой раскладке (включая русскую)
-        def _on_ctrl(event=None):
-            k = event.keycode if event else 0
-            # C = 54 (Linux/Win), 8 (Mac) — копировать
-            if k in (54, 67):
-                try:
-                    self.clipboard_clear()
-                    self.clipboard_append(textbox._textbox.selection_get())
-                except Exception: pass
-                return "break"
-            # A = 38 (Linux/Win), 0 (Mac) — выделить всё
-            if k in (38, 65):
-                try: textbox._textbox.tag_add("sel", "1.0", "end")
-                except Exception: pass
-                return "break"
-            # Всё остальное — не перехватываем
+        inner = textbox._textbox
 
-        textbox.bind("<Control-KeyPress>", _on_ctrl)
-        textbox.bind("<Command-KeyPress>", _on_ctrl)
+        def _on_copy(e=None):
+            try:
+                self.clipboard_clear()
+                self.clipboard_append(inner.selection_get())
+            except Exception: pass
+            return "break"
+
+        def _on_select_all(e=None):
+            try: inner.tag_add("sel", "1.0", "end")
+            except Exception: pass
+            return "break"
+
+        mod = "Command" if platform.system() == "Darwin" else "Control"
+        def safe_bind(seq, func):
+            try: inner.bind(seq, func)
+            except tk.TclError: pass
+
+        for k in['c', 'C', 'с', 'С', 'Cyrillic_es', 'cyrillic_es']: safe_bind(f"<{mod}-KeyPress-{k}>", _on_copy)
+        for k in['a', 'A', 'ф', 'Ф', 'Cyrillic_ef', 'cyrillic_ef']: safe_bind(f"<{mod}-KeyPress-{k}>", _on_select_all)
+        _win_cyrillic_bind(inner, _on_copy, None, None, _on_select_all, None)
 
         menu = tk.Menu(self, tearoff=0, bg="#2b2b2b", fg="white", activebackground="#1f538d", activeforeground="white", borderwidth=0)
-        menu.add_command(label="Копировать", command=lambda: _on_ctrl(type('E', (), {'keycode': 54})()))
+        menu.add_command(label="Копировать", command=_on_copy)
 
         def show_menu(event):
-            try:
-                menu.tk_popup(event.x_root, event.y_root)
-            finally:
-                menu.grab_release()
+            menu.tk_popup(event.x_root, event.y_root)
 
         if platform.system() == "Darwin":
             textbox.bind("<Button-2>", show_menu)
@@ -911,7 +997,8 @@ class AgentGUI(ctk.CTk):
         if not self.async_loop or self.async_loop.is_closed():
             self.append_chat("Система", "⚠️ Агент не запущен. Нажмите «Запустить Агента».", close_bubble=True)
             return
-        def stream_callback(text, is_status): self.after(0, self.append_chat, "Агент", text, isinstance(text, str), not is_status)
+        def stream_callback(text, is_status): 
+            self.after(0, self.append_chat, "Агент", text, isinstance(text, str), not is_status)
         if "GUI_USER" in agent.active_sessions:
             agent.active_sessions["GUI_USER"].put_nowait(content)
             return
@@ -1001,7 +1088,7 @@ class AgentGUI(ctk.CTk):
         if not self.is_running:
             self.btn_toggle.configure(text="Остановить Агента", fg_color="red")
             self.is_running = True
-            self.async_loop = None  # сброс перед созданием нового
+            self.async_loop = None  
             self.bot_thread = threading.Thread(target=self._run_async_bot_thread, daemon=True)
             self.bot_thread.start()
         else:
@@ -1014,14 +1101,12 @@ class AgentGUI(ctk.CTk):
         loop = asyncio.new_event_loop()
         self.async_loop = loop
         asyncio.set_event_loop(loop)
-        # Сбрасываем Lock/Queue от предыдущего loop во избежание "bound to a different event loop"
         agent.reset_session_state()
         try:
             loop.run_until_complete(start_bot())
         except asyncio.CancelledError: pass
         except Exception as e: logging.error(e)
         finally:
-            # Отменяем все pending-задачи перед закрытием
             try:
                 pending = asyncio.all_tasks(loop)
                 for task in pending:

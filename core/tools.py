@@ -8,7 +8,7 @@ import tempfile
 import time
 import re
 import base64
-from config.settings import get_config
+from config.settings import get_config, get_config_dir
 from openai import AsyncOpenAI
 import httpx
 
@@ -26,7 +26,6 @@ except ImportError:
     from PIL import Image, ImageDraw, ImageFont
 
 def _get_aiohttp_session(proxy_url: str):
-    """Безопасное создание aiohttp.ClientSession с поддержкой HTTP Proxy + Auth."""
     if proxy_url:
         try:
             from aiohttp_socks import ProxyConnector
@@ -73,9 +72,39 @@ def _minimize_telegram():
             for hwnd in handles: ShowWindow(hwnd, 6)
     except Exception: pass
 
+# --- ANDROID SUPPORT ---
+def is_android():
+    return "ANDROID_ROOT" in os.environ or "com.termux" in os.environ.get("PREFIX", "")
+
+_android_cmd_prefix = None
+async def _get_android_prefix():
+    global _android_cmd_prefix
+    if _android_cmd_prefix is not None: return _android_cmd_prefix
+    import subprocess
+    try:
+        if subprocess.run(["su", "-c", "id"], capture_output=True).returncode == 0:
+            _android_cmd_prefix = ["su", "-c"]
+            return _android_cmd_prefix
+    except Exception: pass
+    try:
+        if subprocess.run(["adb", "shell", "id"], capture_output=True).returncode == 0:
+            _android_cmd_prefix = ["adb", "shell"]
+            return _android_cmd_prefix
+    except Exception: pass
+    _android_cmd_prefix =[] 
+    return _android_cmd_prefix
+
+
 # --- ФУНКЦИИ ОС И КЛАВИАТУРЫ ---
 
 async def type_text(text: str) -> str:
+    if is_android():
+        prefix = await _get_android_prefix()
+        if prefix is not None:
+            import subprocess
+            subprocess.run(prefix +["input", "text", text.replace(" ", "%s")], capture_output=True)
+            return f"Android: text typed"
+
     if pyautogui is None: return "Ошибка: инструмент клавиатуры недоступен в Headless-режиме."
     try:
         if platform.system() == "Windows":
@@ -112,6 +141,15 @@ async def type_text(text: str) -> str:
         return f"Ошибка ввода текста: {e}"
 
 async def press_key(key: str) -> str:
+    if is_android():
+        prefix = await _get_android_prefix()
+        if prefix is not None:
+            import subprocess
+            key_map = {'enter': '66', 'tab': '61', 'backspace': '67', 'home': '3', 'back': '4'}
+            code = key_map.get(key.lower(), key)
+            subprocess.run(prefix +["input", "keyevent", code], capture_output=True)
+            return f"Android: keyevent {code}"
+
     if pyautogui is None: return "Ошибка: инструмент недоступен в Headless-режиме."
     try:
         pyautogui.press(key)
@@ -128,28 +166,49 @@ async def hotkey(*keys: str) -> str:
 # --- СКРИНШОТЫ И ЗРЕНИЕ ---
 
 async def take_screenshot(output_path: str | None = None, minimize_telegram: bool = True) -> str:
-    if ImageGrab is None: return "Ошибка: Модуль создания скриншотов недоступен (вероятно Headless-режим)."
     try:
         if minimize_telegram:
             _minimize_telegram()
             await asyncio.sleep(0.5)
+        
         screenshots_dir = _get_screenshot_dir(clean=True)
         filename = os.path.basename(output_path) if output_path else f"screenshot_{int(time.time())}.png"
         out_path = os.path.join(screenshots_dir, filename)
 
+        if is_android():
+            prefix = await _get_android_prefix()
+            if prefix is not None:
+                import subprocess
+                sdcard_path = "/sdcard/screen.png"
+                subprocess.run(prefix +["screencap", "-p", sdcard_path], capture_output=True)
+                if prefix and prefix[0] == "adb":
+                    subprocess.run(["adb", "pull", sdcard_path, out_path], capture_output=True)
+                    subprocess.run(["adb", "shell", "rm", sdcard_path], capture_output=True)
+                else:
+                    subprocess.run(["cp", sdcard_path, out_path], capture_output=True)
+                return out_path.replace("\\", "/")
+
+        if ImageGrab is None: return "Ошибка: Модуль создания скриншотов недоступен."
+
         if platform.system() == "Linux":
             try:
-                screenshot = ImageGrab.grab()
-                screenshot.save(out_path)
-            except Exception:
                 import subprocess
-                result = subprocess.run(["scrot", "-z", out_path], capture_output=True, timeout=10)
-                if result.returncode != 0:
-                    return f"Ошибка scrot: {result.stderr.decode()}"
-        else:
-            screenshot = ImageGrab.grab()
-            screenshot.save(out_path)
-
+                res = subprocess.run(["grim", out_path], capture_output=True, timeout=10)
+                if res.returncode == 0: return out_path.replace("\\", "/")
+            except Exception: pass
+            try:
+                import subprocess
+                res = subprocess.run(["gnome-screenshot", "-f", out_path], capture_output=True, timeout=10)
+                if res.returncode == 0: return out_path.replace("\\", "/")
+            except Exception: pass
+            try:
+                import subprocess
+                res = subprocess.run(["scrot", "-z", out_path], capture_output=True, timeout=10)
+                if res.returncode == 0: return out_path.replace("\\", "/")
+            except Exception: pass
+            
+        screenshot = ImageGrab.grab()
+        screenshot.save(out_path)
         return out_path.replace("\\", "/")
     except Exception as e:
         return f"Ошибка: {str(e)}"
@@ -161,6 +220,7 @@ def _get_font(size: int = 13):
     return ImageFont.load_default()
 
 def _annotate_with_grid(image_path: str, cols: int = 10, rows: int = 7) -> tuple[str, dict]:
+    """Рисует равномерную сетку координатных меток на скриншоте."""
     img = Image.open(image_path).convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -185,10 +245,10 @@ def _annotate_with_grid(image_path: str, cols: int = 10, rows: int = 7) -> tuple
     return out_path.replace("\\", "/"), coords_map
 
 async def take_annotated_screenshot(output_path: str | None = None) -> tuple[str, str, dict]:
+    """Делает скриншот. Аннотированная версия = тот же чистый скриншот (оверлеи мешают ИИ читать UI)."""
     orig_path = await take_screenshot(output_path)
     if orig_path.startswith("Ошибка"): return orig_path, orig_path, {}
-    grid_path, coords_map = _annotate_with_grid(orig_path)
-    return orig_path, grid_path, coords_map
+    return orig_path, orig_path, {}
 
 async def analyze_screenshot(image_path: str, prompt: str, use_grid: bool = False) -> str:
     try:
@@ -213,28 +273,51 @@ async def analyze_screenshot(image_path: str, prompt: str, use_grid: bool = Fals
         with open(actual_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
         response = await client.chat.completions.create(
-            model=get_config("model_main"),
+            model=get_config("model_orchestrator"),
             messages=[{"role": "user", "content":[{"type": "text", "text": prompt + grid_hint}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]}]
         )
         return response.choices[0].message.content
     except Exception as e: return f"Ошибка анализа: {str(e)}"
 
 async def smart_click(prompt: str, max_attempts: int = 3) -> str:
-    if pyautogui is None: return "Ошибка: инструмент недоступен в Headless-режиме."
+    """
+    Умный клик: отправляет ИИ ЧИСТЫЙ скриншот + размеры экрана,
+    просит вернуть относительные координаты (0.0–1.0).
+    Никаких сеток — они только мешают ИИ читать интерфейс.
+    """
     try:
-        orig_path, grid_path, _ = await take_annotated_screenshot()
+        orig_path = await take_screenshot()
         if orig_path.startswith("Ошибка"): return orig_path
-        ai_prompt = f"Найди на скриншоте элемент: «{prompt}»\nОТВЕТЬ СТРОГО В ФОРМАТЕ: (x,y) — точные координаты центра элемента. Пример: (320,240)"
-        for _ in range(max_attempts):
-            resp = await analyze_screenshot(grid_path, ai_prompt)
-            m = re.search(r"\(?\s*(-?\d+)\s*[;,]\s*(-?\d+)\s*\)?", resp)
+
+        if pyautogui:
+            sw, sh = pyautogui.size()
+        else:
+            sw, sh = Image.open(orig_path).size
+
+        ai_prompt = (
+            f"Размер экрана: {sw}×{sh} пикселей.\n"
+            f"Найди на скриншоте элемент: «{prompt}»\n"
+            f"Верни ТОЛЬКО две числа через запятую — относительные координаты центра элемента "
+            f"(от 0.0 до 1.0 по X и Y). Пример: 0.25, 0.73\n"
+            f"Никаких пояснений, только два числа."
+        )
+
+        for attempt in range(max_attempts):
+            resp = await analyze_screenshot(orig_path, ai_prompt)
+            resp_clean = (resp or "").strip()
+            m = re.search(r"(0?\.\d+|1\.0|0|1)\s*[,;]\s*(0?\.\d+|1\.0|0|1)", resp_clean)
             if m:
-                x, y = int(m.group(1)), int(m.group(2))
-                pyautogui.click(x, y)
-                return f"Клик по «{prompt}» в ({x}, {y})"
+                rx, ry = float(m.group(1)), float(m.group(2))
+                # Защита от явно неправильных значений
+                if 0.0 <= rx <= 1.0 and 0.0 <= ry <= 1.0:
+                    x, y = int(rx * sw), int(ry * sh)
+                    await click_mouse(x, y)
+                    return f"✅ Клик по «{prompt}»: ({rx:.2f}, {ry:.2f}) → пиксели ({x}, {y})"
             await asyncio.sleep(0.3)
-        return f"Не удалось определить координаты. Ответ ИИ: {resp}"
-    except Exception as e: return f"Ошибка smart_click: {str(e)}"
+
+        return f"❌ Не удалось найти «{prompt}». Последний ответ ИИ: {resp_clean}"
+    except Exception as e:
+        return f"Ошибка smart_click: {str(e)}"
 
 # --- ПРОЧИЕ ИНСТРУМЕНТЫ ---
 
@@ -244,7 +327,7 @@ async def convert_to_pdf(file_path: str, original_filename: str) -> str | None:
     if not api_key: return None
     ext = original_filename.lower().split('.')[-1]
     if ext in ['docx', 'doc']: input_type, mime = "word", 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    elif ext in ['xlsx', 'xls']: input_type, mime = "excel", 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    elif ext in['xlsx', 'xls']: input_type, mime = "excel", 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     else: return None
     resource_name = make_safe_filename(original_filename)
     try:
@@ -282,8 +365,35 @@ async def web_search(query: str) -> str:
             if response.status != 200: return "Ошибка поиска."
             return "\n".join([f"{i.get('title')} - {i.get('url')}\n{i.get('description')}" for i in (await response.json()).get("web", {}).get("results", [])]) or "Ничего не найдено."
 
+async def checko_api(action: str, query: str) -> str:
+    api_key = get_config("CHECKO_API_KEY")
+    if not api_key: return "Ключ Checko API не настроен."
+    proxy = get_config("PROXY_URL") or None
+    session, proxy_arg = _get_aiohttp_session(proxy)
+    
+    endpoint = "search" if action == "search" else "company"
+    params = {"key": api_key}
+    if action == "search": params["query"] = query
+    elif action == "company": params["inn"] = query
+    
+    try:
+        async with session:
+            async with session.get(f"https://api.checko.ru/v2/{endpoint}", params=params, proxy=proxy_arg) as response:
+                if response.status != 200:
+                    return f"Ошибка Checko API: HTTP {response.status}"
+                data = await response.json()
+                res = json.dumps(data, ensure_ascii=False)
+                return res[:3000] + "\n[ОБРЕЗАНО]" if len(res) > 3000 else res
+    except Exception as e:
+        return f"Ошибка запроса Checko: {e}"
+
 async def file_operation(action: str, filepath: str, content: str = "") -> str:
     try:
+        work_dir = get_config("work_dir") or os.path.join(get_config_dir(), "workspace")
+        if not os.path.isabs(filepath):
+            filepath = os.path.join(work_dir, filepath)
+        filepath = os.path.abspath(filepath)
+        
         if action == "read":
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = f.read()
@@ -295,10 +405,19 @@ async def file_operation(action: str, filepath: str, content: str = "") -> str:
     except Exception as e: return f"Ошибка: {str(e)}"
 
 def _resolve_xy(x: float, y: float, relative: bool = False) -> tuple[int, int]:
-    w, h = pyautogui.size()
-    return int(x * w), int(y * h) if relative else (int(x), int(y))
+    if relative:
+        w, h = pyautogui.size()
+        return int(x * w), int(y * h)
+    return int(x), int(y)
 
 async def click_mouse(x: float, y: float, relative: bool = False, clicks: int = 1, button: str = "left") -> str:
+    if is_android():
+        prefix = await _get_android_prefix()
+        if prefix is not None:
+            import subprocess
+            subprocess.run(prefix +["input", "tap", str(int(x)), str(int(y))], capture_output=True)
+            return f"Android: tap ({x}, {y})"
+
     if pyautogui is None: return "Ошибка: инструмент недоступен в Headless-режиме."
     try:
         xx, yy = _resolve_xy(x, y, relative)
@@ -311,6 +430,6 @@ async def scroll_mouse(x: float, y: float, clicks: int, relative: bool = False) 
     try:
         xx, yy = _resolve_xy(x, y, relative)
         pyautogui.moveTo(xx, yy)
-        pyautogui.scroll(clicks, xx, yy)
+        pyautogui.scroll(clicks)
         return f"Скролл в ({xx}, {yy})"
     except Exception as e: return f"Ошибка скролла: {str(e)}"

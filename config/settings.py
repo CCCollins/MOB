@@ -32,29 +32,22 @@ def get_config_dir():
 _MAGIC = b"MOB\x01"
 
 def _machine_key() -> bytes:
-    """Детерминированный ключ на основе машинных идентификаторов.
-    Не требует пароля пользователя — файл читается только на том же ПК."""
-    parts = [
-        platform.node(),               # имя хоста
-        str(os.path.expanduser("~")),  # домашняя директория
+    parts =[
+        platform.node(),
+        str(os.path.expanduser("~")),
         platform.system(),
         platform.machine(),
     ]
-    # На Windows добавляем MachineGuid из реестра если доступен
     if platform.system() == "Windows":
         try:
             import winreg
-            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                                 r"SOFTWARE\Microsoft\Cryptography")
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography")
             guid, _ = winreg.QueryValueEx(key, "MachineGuid")
             parts.append(guid)
         except Exception:
             pass
     seed = "|".join(parts).encode("utf-8")
-    # PBKDF2 с фиксированной солью (публичной) — безопасность обеспечивается
-    # уникальностью машинных данных, а не секретностью соли
-    dk = hashlib.pbkdf2_hmac("sha256", seed,
-                              b"MOB-machine-salt-v1", iterations=200_000, dklen=32)
+    dk = hashlib.pbkdf2_hmac("sha256", seed, b"MOB-machine-salt-v1", iterations=200_000, dklen=32)
     return base64.urlsafe_b64encode(dk)
 
 def _encrypt(data: str) -> bytes:
@@ -80,6 +73,7 @@ DEFAULT_CONFIG = {
     "OPENROUTER_API_KEY": "",
     "BRAVE_API_KEY": "",
     "DYNAMICPDF_API_KEY": "",
+    "CHECKO_API_KEY": "",
     "PROXY_URL": "",
     "bg_interval": 28800,
     "bg_autostart": False,
@@ -87,7 +81,8 @@ DEFAULT_CONFIG = {
     "history_limit": 40,
     "log_level": "INFO",
     "keep_chain": False,
-    "model_main": "google/gemini-3-flash-preview",
+    "model_orchestrator": "anthropic/claude-haiku-4.5",
+    "model_chat": "google/gemini-3-flash-preview",
     "model_expert": "qwen/qwen3-coder-plus",
     "work_dir": "",
 }
@@ -95,7 +90,6 @@ DEFAULT_CONFIG = {
 # ── Чтение / запись ───────────────────────────────────────────────────────────
 
 def _read_raw() -> dict:
-    """Читает конфиг из зашифрованного .mobcfg файла."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "rb") as f:
@@ -105,7 +99,6 @@ def _read_raw() -> dict:
     return {}
 
 def _write_raw(data: dict):
-    """Записывает конфиг в зашифрованный .mobcfg файл."""
     with open(CONFIG_FILE, "wb") as f:
         f.write(_encrypt(json.dumps(data, indent=4, ensure_ascii=False)))
 

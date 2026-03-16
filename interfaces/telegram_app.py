@@ -40,7 +40,7 @@ def check_autostart() -> bool:
             return json.load(f).get("autostart", False)
     except Exception: return False
 
-BOT_COMMANDS = [
+BOT_COMMANDS =[
     BotCommand(command="memorize",   description="Сохранить факты в память"),
     BotCommand(command="screenshot", description="Отправить скриншот системы"),
     BotCommand(command="clear",      description="Сбросить краткосрочную память"),
@@ -51,8 +51,8 @@ BOT_COMMANDS = [
 async def setup_bot_commands(bot: Bot):
     try:
         current = await bot.get_my_commands()
-        desired_tuples = [(c.command, c.description) for c in BOT_COMMANDS]
-        current_tuples = [(c.command, c.description) for c in current]
+        desired_tuples =[(c.command, c.description) for c in BOT_COMMANDS]
+        current_tuples =[(c.command, c.description) for c in current]
         if current_tuples != desired_tuples:
             await bot.set_my_commands(BOT_COMMANDS)
             logging.info(f"✅ Команды бота обновлены: {[c.command for c in BOT_COMMANDS]}")
@@ -67,7 +67,7 @@ async def setup_bot_commands(bot: Bot):
 
 def _safe_markdown(text: str) -> str:
     text = re.sub(r'\*\*(.+?)\*\*', r'*\1*', text, flags=re.DOTALL)
-    lines = []
+    lines =[]
     for line in text.split('\n'):
         if line.strip().startswith('`'):
             lines.append(line)
@@ -81,7 +81,7 @@ def _safe_markdown(text: str) -> str:
 def is_allowed(user_id: int) -> bool:
     raw_ids = get_config("ALLOWED_TELEGRAM_IDS")
     if not raw_ids: return False
-    allowed = [int(x.strip()) for x in raw_ids.split(",") if x.strip()]
+    allowed =[int(x.strip()) for x in raw_ids.split(",") if x.strip()]
     return user_id in allowed
 
 def get_tg_updater(message: types.Message, bot: Bot):
@@ -96,15 +96,22 @@ def get_tg_updater(message: types.Message, bot: Bot):
                 streaming_msg_id[0] = sent.message_id
             else:
                 await bot.edit_message_text(chat_id=message.chat.id, message_id=streaming_msg_id[0], text=md, parse_mode="Markdown")
+            
+            if is_final:
+                streaming_msg_id[0] = None
             return
         except Exception:
             pass
+        
         try:
             if streaming_msg_id[0] is None:
                 sent = await bot.send_message(message.chat.id, text[:4096], reply_to_message_id=reply_to)
                 streaming_msg_id[0] = sent.message_id
             else:
                 await bot.edit_message_text(chat_id=message.chat.id, message_id=streaming_msg_id[0], text=text[:4096])
+            
+            if is_final:
+                streaming_msg_id[0] = None
         except Exception as e:
             logging.error(f"TG Error: {e}")
 
@@ -173,7 +180,7 @@ async def handle_files(message: types.Message, bot: Bot):
 
     caption_text = message.caption or "Опиши файл"
     ext = orig_name.lower().split('.')[-1]
-    content = [{"type": "text", "text": caption_text}]
+    content =[{"type": "text", "text": caption_text}]
 
     if ext in ('docx', 'doc', 'xlsx', 'xls'):
         pdf_path = await tools.convert_to_pdf(tmp_path, orig_name)
@@ -192,8 +199,6 @@ async def handle_files(message: types.Message, bot: Bot):
     await agent.run_agent(str(message.from_user.id), content, source_channel="Telegram", tg_update_callback=get_tg_updater(message, bot), bot_instance=bot)
 
 def make_dispatcher() -> Dispatcher:
-    """Создаёт свежий Dispatcher с зарегистрированными хендлерами.
-    Вызывается при каждом запуске агента, чтобы не было привязки к старому event loop."""
     new_dp = Dispatcher()
     new_dp.message.register(cmd_memorize,   Command("memorize"))
     new_dp.message.register(cmd_screenshot, Command("screenshot"))
