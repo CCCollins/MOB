@@ -19,6 +19,7 @@ def run_interactive_setup():
         "TELEGRAM_TOKEN": "Telegram Bot Token",
         "ALLOWED_TELEGRAM_IDS": "Разрешенные Telegram ID (через запятую)",
         "OPENROUTER_API_KEY": "OpenRouter API Key",
+        "OPENAI_BASE_URL": "OpenAI Base URL",
         "BRAVE_API_KEY": "Brave Search API Key",
         "DYNAMICPDF_API_KEY": "DynamicPDF API Key",
         "CHECKO_API_KEY": "Checko API Key",

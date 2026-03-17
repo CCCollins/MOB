@@ -71,6 +71,7 @@ DEFAULT_CONFIG = {
     "TELEGRAM_TOKEN": "",
     "ALLOWED_TELEGRAM_IDS": "",
     "OPENROUTER_API_KEY": "",
+    "OPENAI_BASE_URL": "https://openrouter.ai/api/v1",
     "BRAVE_API_KEY": "",
     "DYNAMICPDF_API_KEY": "",
     "CHECKO_API_KEY": "",

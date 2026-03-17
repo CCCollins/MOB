@@ -120,6 +120,7 @@ class AgentGUI(ctk.CTk):
             "TELEGRAM_TOKEN":       ("Telegram Bot Token",   "https://telegram.me/BotFather"),
             "ALLOWED_TELEGRAM_IDS": ("Разрешенные TG ID",    "https://tg-user.id/"),
             "OPENROUTER_API_KEY":   ("OpenRouter API Key",   "https://openrouter.ai/settings/keys"),
+            "OPENAI_BASE_URL":      ("API Base URL",         "https://www.token-calculator.com/blog/llm-api-reference-base-urls-model-ids-2025"),
             "BRAVE_API_KEY":        ("Brave Search API Key", "https://api-dashboard.search.brave.com/app/keys"),
             "DYNAMICPDF_API_KEY":   ("DynamicPDF API Key",   "https://dpdf.io/"),
             "CHECKO_API_KEY":       ("Checko API Key",       "https://checko.ru/integration/api"),

@@ -251,9 +251,10 @@ async def take_annotated_screenshot(output_path: str | None = None) -> tuple[str
     return orig_path, orig_path, {}
 
 async def analyze_screenshot(image_path: str, prompt: str, use_grid: bool = False) -> str:
+    http_client = None
+    client = None
     try:
         proxy_url = get_config("PROXY_URL") or None
-        http_client = None
         if proxy_url:
             try:
                 http_client = httpx.AsyncClient(proxy=proxy_url)
@@ -265,19 +266,30 @@ async def analyze_screenshot(image_path: str, prompt: str, use_grid: bool = Fals
             api_key=get_config("OPENROUTER_API_KEY"),
             http_client=http_client
         )
+        
         actual_path = image_path
         grid_hint = ""
         if use_grid:
             actual_path, _ = _annotate_with_grid(image_path)
             grid_hint = "\nНА СКРИНШОТЕ НАНЕСЕНА СЕТКА. Назови координаты (x,y) ближайшей точки к нужному элементу."
+            
         with open(actual_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
+            
         response = await client.chat.completions.create(
             model=get_config("model_orchestrator"),
             messages=[{"role": "user", "content":[{"type": "text", "text": prompt + grid_hint}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]}]
         )
         return response.choices[0].message.content
-    except Exception as e: return f"Ошибка анализа: {str(e)}"
+        
+    except Exception as e: 
+        return f"Ошибка анализа: {str(e)}"
+        
+    finally:
+        if client:
+            await client.close()
+        if http_client:
+            await http_client.aclose()
 
 async def smart_click(prompt: str, max_attempts: int = 3) -> str:
     """
