@@ -55,6 +55,17 @@ info "Устанавливаем Python-зависимости..."
 pip install -r "$SCRIPT_DIR/requirements.txt" \
     || warn "Ошибки при установке некоторых pip-пакетов (см. выше)"
 
+info "Устанавливаем Playwright и Chromium..."
+pip install playwright -q || warn "Не удалось установить playwright"
+if command -v playwright &>/dev/null || "$VENV_DIR/bin/playwright" --version &>/dev/null 2>&1; then
+    "$VENV_DIR/bin/playwright" install chromium || warn "Не удалось скачать Chromium"
+    "$VENV_DIR/bin/playwright" install-deps chromium 2>/dev/null \
+        || sudo "$VENV_DIR/bin/playwright" install-deps chromium 2>/dev/null \
+        || warn "Не удалось установить системные зависимости Chromium (попробуй вручную: playwright install-deps chromium)"
+else
+    warn "playwright не найден в venv, пропускаю установку Chromium"
+fi
+
 RUN_SCRIPT="$SCRIPT_DIR/run.sh"
 cat > "$RUN_SCRIPT" << 'RUNEOF'
 #!/usr/bin/env bash

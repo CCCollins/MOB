@@ -5,8 +5,6 @@ import sys
 import hashlib
 import base64
 
-# ── Определение режима и директорий ──────────────────────────────────────────
-
 def _is_portable() -> bool:
     return os.path.isdir(os.path.join(_get_exe_dir(), "data"))
 
@@ -26,8 +24,6 @@ def get_config_dir():
         d = os.path.join(os.path.expanduser("~"), ".config", "MOB")
     os.makedirs(d, exist_ok=True)
     return d
-
-# ── Шифрование: машинный ключ (без ручного пароля) ───────────────────────────
 
 _MAGIC = b"MOB\x01"
 
@@ -63,8 +59,6 @@ def _decrypt(raw: bytes) -> str:
     except InvalidToken:
         raise ValueError("Не удалось расшифровать конфиг (другая машина или повреждён файл).")
 
-# ── Пути к файлам конфига ─────────────────────────────────────────────────────
-
 CONFIG_FILE   = os.path.join(get_config_dir(), "config.mobcfg")
 
 DEFAULT_CONFIG = {
@@ -72,6 +66,7 @@ DEFAULT_CONFIG = {
     "ALLOWED_TELEGRAM_IDS": "",
     "OPENROUTER_API_KEY": "",
     "OPENAI_BASE_URL": "https://openrouter.ai/api/v1",
+    "LOCAL_CONTEXT_SIZE": 4096,
     "BRAVE_API_KEY": "",
     "DYNAMICPDF_API_KEY": "",
     "CHECKO_API_KEY": "",
@@ -87,8 +82,6 @@ DEFAULT_CONFIG = {
     "model_expert": "qwen/qwen3-coder-plus",
     "work_dir": "",
 }
-
-# ── Чтение / запись ───────────────────────────────────────────────────────────
 
 def _read_raw() -> dict:
     if os.path.exists(CONFIG_FILE):

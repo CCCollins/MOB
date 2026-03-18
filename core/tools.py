@@ -10,6 +10,7 @@ import re
 import base64
 from config.settings import get_config, get_config_dir
 from openai import AsyncOpenAI
+import urllib.parse
 import httpx
 
 try:
@@ -33,7 +34,6 @@ def _get_aiohttp_session(proxy_url: str):
         except ImportError:
             return aiohttp.ClientSession(), proxy_url
     return aiohttp.ClientSession(), None
-
 
 _SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "screenshots")
 _screenshots_cleared = False
@@ -72,7 +72,6 @@ def _minimize_telegram():
             for hwnd in handles: ShowWindow(hwnd, 6)
     except Exception: pass
 
-# --- ANDROID SUPPORT ---
 def is_android():
     return "ANDROID_ROOT" in os.environ or "com.termux" in os.environ.get("PREFIX", "")
 
@@ -93,9 +92,6 @@ async def _get_android_prefix():
     except Exception: pass
     _android_cmd_prefix =[] 
     return _android_cmd_prefix
-
-
-# --- ФУНКЦИИ ОС И КЛАВИАТУРЫ ---
 
 async def type_text(text: str) -> str:
     if is_android():
@@ -163,8 +159,6 @@ async def hotkey(*keys: str) -> str:
         return f"Горячая клавиша {'+'.join(keys)} нажата"
     except Exception as e: return f"Ошибка горячей клавиши: {str(e)}"
 
-# --- СКРИНШОТЫ И ЗРЕНИЕ ---
-
 async def take_screenshot(output_path: str | None = None, minimize_telegram: bool = True) -> str:
     try:
         if minimize_telegram:
@@ -220,7 +214,6 @@ def _get_font(size: int = 13):
     return ImageFont.load_default()
 
 def _annotate_with_grid(image_path: str, cols: int = 10, rows: int = 7) -> tuple[str, dict]:
-    """Рисует равномерную сетку координатных меток на скриншоте."""
     img = Image.open(image_path).convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -245,7 +238,6 @@ def _annotate_with_grid(image_path: str, cols: int = 10, rows: int = 7) -> tuple
     return out_path.replace("\\", "/"), coords_map
 
 async def take_annotated_screenshot(output_path: str | None = None) -> tuple[str, str, dict]:
-    """Делает скриншот. Аннотированная версия = тот же чистый скриншот (оверлеи мешают ИИ читать UI)."""
     orig_path = await take_screenshot(output_path)
     if orig_path.startswith("Ошибка"): return orig_path, orig_path, {}
     return orig_path, orig_path, {}
@@ -254,16 +246,40 @@ async def analyze_screenshot(image_path: str, prompt: str, use_grid: bool = Fals
     http_client = None
     client = None
     try:
-        proxy_url = get_config("PROXY_URL") or None
-        if proxy_url:
+        base_url = get_config("OPENAI_BASE_URL")
+        if base_url:
+            base_url = base_url.strip().rstrip("/")
+            if any(x in base_url for x in["localhost", "127.0.0.1", "0.0.0.0"]) and not base_url.endswith("/v1"):
+                base_url += "/v1"
+        else:
+            base_url = "https://openrouter.ai/api/v1"
+
+        api_key = get_config("OPENROUTER_API_KEY") or "sk-local-dummy-key"
+        is_local_api = "127.0.0.1" in base_url or "localhost" in base_url or "0.0.0.0" in base_url
+
+        proxy_raw = get_config("PROXY_URL")
+        if proxy_raw and proxy_raw.strip() and not is_local_api:
+            proxy_raw = proxy_raw.strip()
+            if not proxy_raw.startswith("http") and not proxy_raw.startswith("socks"):
+                parts = proxy_raw.split(":")
+                if len(parts) == 4:
+                    ip, port, user, pwd = parts
+                    user_enc = urllib.parse.quote(user)
+                    pwd_enc = urllib.parse.quote(pwd)
+                    proxy_url = f"http://{user_enc}:{pwd_enc}@{ip}:{port}"
+                else:
+                    proxy_url = f"http://{proxy_raw}"
+            else:
+                proxy_url = proxy_raw
+
             try:
                 http_client = httpx.AsyncClient(proxy=proxy_url)
             except TypeError:
                 http_client = httpx.AsyncClient(proxies=proxy_url)
 
         client = AsyncOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=get_config("OPENROUTER_API_KEY"),
+            base_url=base_url, 
+            api_key=api_key,
             http_client=http_client
         )
         
@@ -292,11 +308,6 @@ async def analyze_screenshot(image_path: str, prompt: str, use_grid: bool = Fals
             await http_client.aclose()
 
 async def smart_click(prompt: str, max_attempts: int = 3) -> str:
-    """
-    Умный клик: отправляет ИИ ЧИСТЫЙ скриншот + размеры экрана,
-    просит вернуть относительные координаты (0.0–1.0).
-    Никаких сеток — они только мешают ИИ читать интерфейс.
-    """
     try:
         orig_path = await take_screenshot()
         if orig_path.startswith("Ошибка"): return orig_path
@@ -320,7 +331,6 @@ async def smart_click(prompt: str, max_attempts: int = 3) -> str:
             m = re.search(r"(0?\.\d+|1\.0|0|1)\s*[,;]\s*(0?\.\d+|1\.0|0|1)", resp_clean)
             if m:
                 rx, ry = float(m.group(1)), float(m.group(2))
-                # Защита от явно неправильных значений
                 if 0.0 <= rx <= 1.0 and 0.0 <= ry <= 1.0:
                     x, y = int(rx * sw), int(ry * sh)
                     await click_mouse(x, y)
@@ -330,8 +340,6 @@ async def smart_click(prompt: str, max_attempts: int = 3) -> str:
         return f"❌ Не удалось найти «{prompt}». Последний ответ ИИ: {resp_clean}"
     except Exception as e:
         return f"Ошибка smart_click: {str(e)}"
-
-# --- ПРОЧИЕ ИНСТРУМЕНТЫ ---
 
 async def convert_to_pdf(file_path: str, original_filename: str) -> str | None:
     api_key = get_config("DYNAMICPDF_API_KEY")
@@ -398,6 +406,122 @@ async def checko_api(action: str, query: str) -> str:
                 return res[:3000] + "\n[ОБРЕЗАНО]" if len(res) > 3000 else res
     except Exception as e:
         return f"Ошибка запроса Checko: {e}"
+
+async def open_url(url: str) -> str:
+    """Открывает URL в браузере по умолчанию."""
+    try:
+        import webbrowser
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        webbrowser.open(url)
+        return f"Открыто в браузере: {url}"
+    except Exception as e:
+        return f"Ошибка открытия URL: {e}"
+
+async def fetch_url(url: str, max_chars: int = 8000) -> str:
+    """Скачивает текст страницы. Сначала пробует httpx, при неудаче — playwright (JS-рендеринг)."""
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    proxy = get_config("PROXY_URL") or None
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
+    }
+
+    def _clean_html(raw: str) -> str:
+        raw = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw, flags=re.DOTALL | re.IGNORECASE)
+        raw = re.sub(r"<[^>]+>", " ", raw)
+        raw = re.sub(r"&[a-z#0-9]+;", " ", raw)
+        raw = re.sub(r"\s{3,}", "\n\n", raw)
+        return raw.strip()
+
+    # Попытка 1: быстрый httpx
+    try:
+        proxies = {"http://": proxy, "https://": proxy} if proxy else None
+        async with httpx.AsyncClient(headers=headers, proxies=proxies, follow_redirects=True, timeout=20) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            text = _clean_html(resp.text)
+            if len(text) > 300:  # Получили нормальный контент
+                if len(text) > max_chars:
+                    text = text[:max_chars] + f"\n\n...[ОБРЕЗАНО, показано {max_chars} из {len(text)} символов]"
+                return text
+    except Exception:
+        pass
+
+    # Попытка 2: playwright с JS-рендерингом
+    return await browser_page(url, action="read", max_chars=max_chars)
+
+
+async def browser_page(url: str, action: str = "read", selector: str = "", max_chars: int = 8000) -> str:
+    """Headless-браузер (Playwright). Рендерит JS, умеет читать динамические страницы.
+    action: 'read' — вернуть текст страницы, 'screenshot' — сделать скриншот и вернуть путь.
+    selector: CSS-селектор для извлечения конкретного элемента (опционально).
+    """
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    proxy = get_config("PROXY_URL") or None
+
+    if is_android():
+        return "Headless-браузер недоступен на Android."
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return "Ошибка: playwright не установлен. Выполни: pip install playwright && playwright install chromium"
+
+    try:
+        async with async_playwright() as pw:
+            launch_args = {
+                "headless": True,
+                "args": [
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-setuid-sandbox",
+                ],
+            }            
+            if proxy:
+                launch_args["proxy"] = {"server": proxy}
+
+            browser = await pw.chromium.launch(**launch_args)
+            ctx = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+                locale="ru-RU",
+            )
+            page = await ctx.new_page()
+
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            # Ждём немного чтобы JS отработал
+            await page.wait_for_timeout(1500)
+
+            if action == "screenshot":
+                screenshots_dir = _get_screenshot_dir()
+                out_path = os.path.join(screenshots_dir, f"browser_{int(time.time())}.png")
+                await page.screenshot(path=out_path, full_page=False)
+                await browser.close()
+                return out_path
+
+            # action == "read"
+            if selector:
+                try:
+                    el = await page.query_selector(selector)
+                    raw = await el.inner_text() if el else await page.inner_text("body")
+                except Exception:
+                    raw = await page.inner_text("body")
+            else:
+                raw = await page.inner_text("body")
+
+            await browser.close()
+
+            raw = re.sub(r"\s{3,}", "\n\n", raw.strip())
+            if len(raw) > max_chars:
+                raw = raw[:max_chars] + f"\n\n...[ОБРЕЗАНО, показано {max_chars} из {len(raw)} символов]"
+            return raw or "Страница пустая или текст не извлечён."
+
+    except Exception as e:
+        return f"Ошибка браузера: {e}"
+
 
 async def file_operation(action: str, filepath: str, content: str = "") -> str:
     try:

@@ -9,6 +9,7 @@ from openai import AsyncOpenAI
 from aiogram.types import FSInputFile
 import core.database as db
 import core.tools as tools
+import urllib.parse
 from config.settings import get_config, get_config_dir
 import os
 
@@ -67,6 +68,10 @@ def get_system_prompt(source_channel: str) -> str:
 ПРАВИЛА ТЕКСТА: Без символа # для заголовков. Заголовки: **жирный текст**. Списки: только эмодзи. Код: обратные кавычки.
 СМАЙЛИКИ: Используй минимально (максимум 1-2 на сообщение). Категорически запрещено спамить длинными цепочками смайликов!
 
+РАБОТА С БРАУЗЕРОМ И ИНТЕРНЕТОМ:
+`web_search` — поиск по запросу (Brave). `open_url(url)` — открыть ссылку в браузере пользователя. `fetch_url(url)` — прочитать страницу (авто: сначала HTTP, потом headless Chromium). `browser_page(url, action, selector)` — явный headless Chromium, action='read'/'screenshot', selector — CSS-селектор блока.
+Паттерн: если дана конкретная ссылка — сразу fetch_url. Если нужен поиск — web_search → fetch_url лучшего результата. Для скриншота сайта — browser_page(action='screenshot').
+
 ДЕЛЕГИРОВАНИЕ ЗАДАЧ (ЭКОНОМИЯ ТОКЕНОВ И ВРЕМЕНИ):
 - Для сложного программирования: вызывай `delegate_task_to_expert`.
 - `ask_chat_model` — только если нужно написать текст ПОЛЬЗОВАТЕЛЮ в чат (ответить на вопрос, сгенерировать эссе, перевести). Если задача подразумевает напечатать что-то в программе на экране — это `type_text`, а не `ask_chat_model`.
@@ -112,49 +117,69 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
     if user_message: db.add_to_history(user_id, {"role": "user", "content": user_message})
 
     def _sanitize_messages(msgs):
-        answered_ids = set()
-        for msg in msgs:
-            if msg.get("role") == "tool" and msg.get("tool_call_id"):
-                answered_ids.add(msg["tool_call_id"])
+        # Убираем служебные system-записи об ошибках и прерываниях
+        msgs = [m for m in msgs if not (
+            m.get("role") == "system" and
+            isinstance(m.get("content"), str) and
+            (m["content"].startswith("[ОШИБКА") or m["content"].startswith("[ПРЕРВАНО"))
+        )]
 
-        result =[]
+        # Шаг 1: нормализуем все tool_call ID до 40 символов ПЕРВЫМ делом,
+        # чтобы assistant и tool записи использовали одинаковые ID
+        def _norm_id(id_str: str) -> str:
+            return id_str[-40:] if id_str and len(id_str) > 40 else id_str
+
+        normalized = []
         for msg in msgs:
+            msg = dict(msg)  # не мутируем оригинал из БД
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                call_ids =[tc.get("id") for tc in msg["tool_calls"] if tc.get("id")]
+                msg["tool_calls"] = [
+                    dict(tc, id=_norm_id(tc.get("id", "")))
+                    for tc in msg["tool_calls"]
+                ]
+            if msg.get("role") == "tool" and msg.get("tool_call_id"):
+                msg["tool_call_id"] = _norm_id(msg["tool_call_id"])
+            normalized.append(msg)
+
+        # Шаг 2: собираем ID всех tool_result — они отвечают на какой-то tool_use
+        answered_ids = {
+            m["tool_call_id"]
+            for m in normalized
+            if m.get("role") == "tool" and m.get("tool_call_id")
+        }
+
+        # Шаг 3: убираем assistant+tool_calls без ответа
+        result = []
+        for msg in normalized:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                call_ids = [tc.get("id") for tc in msg["tool_calls"] if tc.get("id")]
                 if call_ids and not any(cid in answered_ids for cid in call_ids):
                     continue
             result.append(msg)
 
-        assistant_call_ids = set()
-        for msg in result:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    if tc.get("id"):
-                        assistant_call_ids.add(tc["id"])
+        # Шаг 4: собираем ID всех tool_use которые остались в assistant
+        assistant_call_ids = {
+            tc.get("id")
+            for msg in result
+            if msg.get("role") == "assistant" and msg.get("tool_calls")
+            for tc in msg["tool_calls"]
+            if tc.get("id")
+        }
 
-        final =[]
-        for msg in result:
-            if msg.get("role") == "tool" and msg.get("tool_call_id") not in assistant_call_ids:
-                continue
-            final.append(msg)
+        # Шаг 5: убираем tool_result без соответствующего tool_use
+        final = [
+            msg for msg in result
+            if not (msg.get("role") == "tool" and msg.get("tool_call_id") not in assistant_call_ids)
+        ]
 
-        for msg in final:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    if tc.get("id") and len(tc["id"]) > 40:
-                        tc["id"] = tc["id"][-40:]
-            if msg.get("role") == "tool" and msg.get("tool_call_id"):
-                if len(msg["tool_call_id"]) > 40:
-                    msg["tool_call_id"] = msg["tool_call_id"][-40:]
+        removed = len(msgs) - len(final)
+        if removed > 0:
+            logging.warning(f"[Agent] История {user_id}: найдено {removed} висячих tool_call записей, они исключены из контекста запроса (БД не изменяется).")
 
         return final
 
     raw_history = db.get_history(user_id)
     clean_history = _sanitize_messages(raw_history)
-
-    if len(clean_history) != len(raw_history):
-        removed = len(raw_history) - len(clean_history)
-        logging.warning(f"[Agent] История {user_id}: найдено {removed} висячих tool_call записей, они исключены из контекста запроса (БД не изменяется).")
 
     memory_context = ""
     if user_message:
@@ -170,18 +195,163 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
     if memory_context:
         system_content = system_content + "\n\n" + memory_context
 
-    messages =[{"role": "system", "content": system_content}] + clean_history
+    system_msg = {"role": "system", "content": system_content}
     
-    proxy_url = get_config("PROXY_URL") or None
+    # === УМНЫЙ ОПТИМИЗАТОР КОНТЕКСТА ===
+    ctx_limit_raw = get_config("LOCAL_CONTEXT_SIZE")
+    ctx_limit = int(ctx_limit_raw) if ctx_limit_raw else 8192
+
+    def _estimate_tokens(msg):
+        tokens = 0
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            tokens += len(content) // 4
+        elif isinstance(content, list):
+            for item in content:
+                if item.get("type") == "text":
+                    tokens += len(item.get("text", "")) // 4
+                elif item.get("type") == "image_url":
+                    tokens += 1000  
+        if msg.get("tool_calls"):
+            tokens += len(str(msg["tool_calls"])) // 4
+        return tokens
+
+    budget = ctx_limit - 2500 - _estimate_tokens(system_msg)
+    if budget < 1000: budget = 1000 
+
+    kept_history =[]
+    for msg in reversed(clean_history):
+        cost = _estimate_tokens(msg)
+        if budget - cost >= 0:
+            budget -= cost
+            kept_history.insert(0, msg)
+        else:
+            logging.warning(f"[{user_id}] Контекст заполнен! Старые сообщения отрезаны, чтобы избежать 500 ошибки.")
+            break
+
+    messages = [system_msg] + kept_history
+
+    # Настройка URL и прокси
+    base_url = get_config("OPENAI_BASE_URL")
+    if base_url:
+        base_url = base_url.strip().rstrip("/")
+        if any(x in base_url for x in["localhost", "127.0.0.1", "0.0.0.0"]) and not base_url.endswith("/v1"):
+            base_url += "/v1"
+    else:
+        base_url = "https://openrouter.ai/api/v1"
+
+    api_key = get_config("OPENROUTER_API_KEY") or "sk-local-dummy-key"
+    is_local_api = "127.0.0.1" in base_url or "localhost" in base_url or "0.0.0.0" in base_url
+
+    def _flatten_for_local(msgs: list) -> list:
+        """Преобразует историю в простой user/assistant/system формат для локальных моделей.
+        - role:tool → role:user
+        - assistant без content → текстовое описание вызова
+        - Подряд идущие одинаковые роли (кроме system) схлопываются
+        - Гарантирует что последнее сообщение — user
+        """
+        result = []
+
+        for msg in msgs:
+            role = msg.get("role")
+
+            if role == "system":
+                # Пропускаем системные записи об ошибках из БД — это не настоящий system prompt
+                content = msg.get("content", "")
+                if content.startswith("[ОШИБКА") or content.startswith("[ПРЕРВАНО"):
+                    continue
+                result.append({"role": "system", "content": content})
+                continue
+
+            if role == "tool":
+                tool_name = msg.get("name", "tool")
+                content = msg.get("content", "")
+                result.append({"role": "user", "content": f"[Результат {tool_name}]:\n{content}"})
+                continue
+
+            if role == "assistant":
+                text = msg.get("content") or ""
+                tool_calls = msg.get("tool_calls")
+                if tool_calls and not text:
+                    names = ", ".join(tc.get("function", {}).get("name", "?") for tc in tool_calls)
+                    text = f"[Вызываю: {names}]"
+                result.append({"role": "assistant", "content": text or "…"})
+                continue
+
+            if role == "user":
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    text_parts = []
+                    image_parts = []
+                    for p in content:
+                        if p.get("type") == "text":
+                            text_parts.append(p.get("text", ""))
+                        elif p.get("type") in ("image_url", "image"):
+                            image_parts.append(p)
+                    if image_parts:
+                        result.append({"role": "user", "content": [{"type": "text", "text": "\n".join(text_parts)}] + image_parts})
+                    else:
+                        result.append({"role": "user", "content": "\n".join(text_parts) or "?"})
+                else:
+                    result.append({"role": "user", "content": content or "?"})
+                continue
+
+        # Схлопываем подряд идущие одинаковые роли (кроме system)
+        merged = []
+        for m in result:
+            role = m["role"]
+            if role == "system":
+                merged.append(dict(m))
+                continue
+            if merged and merged[-1]["role"] == role:
+                prev_c = merged[-1]["content"]
+                cur_c = m["content"]
+                if isinstance(prev_c, list) or isinstance(cur_c, list):
+                    if isinstance(prev_c, str):
+                        prev_c = [{"type": "text", "text": prev_c}]
+                    if isinstance(cur_c, str):
+                        cur_c = [{"type": "text", "text": cur_c}]
+                    merged[-1]["content"] = prev_c + [{"type": "text", "text": "\n---\n"}] + cur_c
+                else:
+                    sep = "\n\n---\n\n" if role == "user" else "\n"
+                    merged[-1]["content"] = prev_c + sep + cur_c
+            else:
+                merged.append(dict(m))
+
+        # Убираем system в самый конец если он вдруг там оказался
+        # и гарантируем что последнее не-system сообщение — user
+        non_system = [m for m in merged if m["role"] != "system"]
+        systems = [m for m in merged if m["role"] == "system"]
+        if non_system and non_system[-1]["role"] != "user":
+            non_system.append({"role": "user", "content": "Продолжай."})
+        final = systems + non_system
+
+        log.debug(f"[flatten] roles: {[m['role'] for m in final]}")
+        return final
+
+    proxy_raw = get_config("PROXY_URL")
+    proxy_url = None
     http_client = None
-    if proxy_url:
+
+    if proxy_raw and proxy_raw.strip() and not is_local_api:
+        proxy_raw = proxy_raw.strip()
+        
+        if not proxy_raw.startswith("http") and not proxy_raw.startswith("socks"):
+            parts = proxy_raw.split(":")
+            if len(parts) == 4:
+                ip, port, user, pwd = parts
+                user_enc = urllib.parse.quote(user)
+                pwd_enc = urllib.parse.quote(pwd)
+                proxy_url = f"http://{user_enc}:{pwd_enc}@{ip}:{port}"
+            else:
+                proxy_url = f"http://{proxy_raw}"
+        else:
+            proxy_url = proxy_raw
+
         try:
             http_client = httpx.AsyncClient(proxy=proxy_url)
         except TypeError:
             http_client = httpx.AsyncClient(proxies=proxy_url)
-
-    base_url = get_config("OPENAI_BASE_URL") or "https://openrouter.ai/api/v1"
-    api_key = get_config("OPENROUTER_API_KEY") or "sk-local-dummy-key"
 
     client = AsyncOpenAI(
         base_url=base_url, 
@@ -215,16 +385,21 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
             {"type": "function", "function": {"name": "send_telegram_message", "description": "Инициировать сообщение в Telegram.", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required":["text"]}}},
             {"type": "function", "function": {"name": "analyze_screenshot", "description": "Анализ скриншота.", "parameters": {"type": "object", "properties": {"image_path": {"type": "string"}, "prompt": {"type": "string"}, "use_grid": {"type": "boolean"}}, "required":["image_path", "prompt"]}}},
             {"type": "function", "function": {"name": "click_mouse", "description": "Клик мышью по координатам.", "parameters": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "button": {"type": "string"}}, "required":["x", "y"]}}},
-            {"type": "function", "function": {"name": "type_text", "description": "Напечатать текст в активном окне на экране (в программе ОС: браузере, Telegram, редакторе и т.д.). Используй это когда нужно что-то написать в приложении на компьютере.", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}},
+            {"type": "function", "function": {"name": "type_text", "description": "Напечатать текст в активном окне на экране (в программе ОС: браузере, Telegram, редакторе и т.д.). Используй это когда нужно что-то написать в приложении на компьютере.", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required":["text"]}}},
             {"type": "function", "function": {"name": "press_key", "description": "Нажать 1 клавишу (enter, tab, win).", "parameters": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}}},
             {"type": "function", "function": {"name": "hotkey", "description": "Горячая клавиша (['alt', 'tab']).", "parameters": {"type": "object", "properties": {"keys": {"type": "array", "items": {"type": "string"}}}, "required": ["keys"]}}},
             {"type": "function", "function": {"name": "smart_click", "description": "Умный клик по элементу через зрение.", "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required":["prompt"]}}},
-            {"type": "function", "function": {"name": "checko_api", "description": "Поиск компаний и ИП через Checko API.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["search", "company"]}, "query": {"type": "string"}}, "required": ["action", "query"]}}},
+            {"type": "function", "function": {"name": "open_url", "description": "Открыть URL в браузере по умолчанию на компьютере пользователя. Используй для открытия сайтов, документации, ссылок из поиска.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "Полный URL (https://...)"}}, "required": ["url"]}}},
+            {"type": "function", "function": {"name": "fetch_url", "description": "Прочитать содержимое страницы. Сначала пробует быстрый HTTP, при неудаче автоматически переключается на headless-браузер с JS. Используй для чтения статей, GitHub, документации, новостей.", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "max_chars": {"type": "integer", "description": "Максимум символов (по умолч. 8000)"}}, "required": ["url"]}}},
+            {"type": "function", "function": {"name": "browser_page", "description": "Headless Chromium (Playwright). Используй для JS-сайтов, SPA, авторизованных страниц. action='read' — вернуть текст, action='screenshot' — скриншот страницы. selector — CSS-селектор для конкретного блока.", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "action": {"type": "string", "enum": ["read", "screenshot"], "description": "read или screenshot"}, "selector": {"type": "string", "description": "CSS-селектор (опционально)"}, "max_chars": {"type": "integer"}}, "required": ["url"]}}},
+            {"type": "function", "function": {"name": "checko_api", "description": "Поиск компаний и ИП через Checko API.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum":["search", "company"]}, "query": {"type": "string"}}, "required": ["action", "query"]}}},
         ]
 
         max_iter = int(get_config("max_iterations") or 10)
         keep_chain = bool(get_config("keep_chain"))
-        chain_thoughts: list[str] =[]   
+        chain_thoughts: list[str] =[]
+        _last_tool_sig: str | None = None   # для детектирования зацикливания
+        _loop_count: int = 0
 
         def _format_chain(current_status: str = "") -> str:
             parts =[]
@@ -238,7 +413,21 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
 
             full_text, tool_calls_dict, last_edit = "", {}, 0
             try:
-                stream = await client.chat.completions.create(model=get_config("model_orchestrator"), messages=messages, tools=TOOLS, tool_choice="auto", stream=True)
+                send_messages = _flatten_for_local(messages) if is_local_api else messages
+                # Для локальных моделей после нескольких итераций добавляем явный стоп-хинт
+                if is_local_api and iteration > 0 and send_messages and send_messages[-1]["role"] == "user":
+                    hint = "\n\n[ИНСТРУКЦИЯ]: Если задача уже выполнена или результат получен — ОБЯЗАТЕЛЬНО напиши итоговый ответ пользователю текстом и НЕ вызывай больше инструменты."
+                    last = send_messages[-1]
+                    if isinstance(last["content"], str):
+                        send_messages = send_messages[:-1] + [{"role": "user", "content": last["content"] + hint}]
+                stream = await client.chat.completions.create(
+                    model=get_config("model_orchestrator"),
+                    messages=send_messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    stream=True,
+                    **({"max_tokens": max(512, ctx_limit // 4)} if is_local_api else {})
+                )
                 async for chunk in stream:
                     if not chunk.choices: continue
                     delta = chunk.choices[0].delta
@@ -267,6 +456,21 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
             if tool_calls: msg_to_save["tool_calls"] = tool_calls
             db.add_to_history(user_id, msg_to_save)
             messages.append(msg_to_save)
+
+            # Детектирование зацикливания: та же функция с теми же аргументами
+            if is_local_api and tool_calls:
+                sig = str([(tc["function"]["name"], tc["function"]["arguments"]) for tc in tool_calls])
+                if sig == _last_tool_sig:
+                    _loop_count += 1
+                else:
+                    _last_tool_sig = sig
+                    _loop_count = 0
+                if _loop_count >= 2:
+                    log.warning(f"[{user_id}] Обнаружено зацикливание инструмента, принудительно завершаю.")
+                    final_ans = full_text.strip() or "✅ Задача выполнена."
+                    await _tg_final(final_ans)
+                    _gui_final(final_ans)
+                    return
 
             while not active_sessions[user_id].empty():
                 new_msg = active_sessions[user_id].get_nowait()
@@ -386,6 +590,9 @@ async def _run_agent_core(user_id, user_message, source_channel, is_background, 
                     shot = await tools.take_screenshot()
                     result += f"\n[Скриншот после клика: {shot}]"
                 elif f_name == "checko_api": result = await tools.checko_api(args.get("action", ""), args.get("query", ""))
+                elif f_name == "open_url": result = await tools.open_url(args.get("url", ""))
+                elif f_name == "fetch_url": result = await tools.fetch_url(args.get("url", ""), args.get("max_chars", 8000))
+                elif f_name == "browser_page": result = await tools.browser_page(args.get("url", ""), args.get("action", "read"), args.get("selector", ""), args.get("max_chars", 8000))
 
                 tool_msg = {"role": "tool", "tool_call_id": tc["id"], "name": f_name, "content": str(result)}
                 db.add_to_history(user_id, tool_msg)

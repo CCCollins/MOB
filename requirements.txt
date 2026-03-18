@@ -11,3 +11,6 @@ pyautogui
 pynput
 pyperclip
 cryptography
+pymupdf
+pytesseract
+playwright

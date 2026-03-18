@@ -1,6 +1,6 @@
 [Setup]
 AppName=Militech Open Bot Portable
-AppVersion=2.9
+AppVersion=2.92
 ; Portable: устанавливается куда угодно, не требует прав, не пишет в реестр
 DefaultDirName={autopf}\MOB_Portable
 PrivilegesRequired=lowest

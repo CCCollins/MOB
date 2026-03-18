@@ -25,25 +25,24 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 def _win_cyrillic_bind(inner, copy_fn, paste_fn, cut_fn, sel_fn, undo_fn, redo_fn=None):
-    """На Windows Ctrl+кириллица даёт keysym='??', ловим по keycode физической клавиши."""
     if platform.system() != "Windows":
         return
     KEYCODE_MAP = {
-        67: copy_fn,   # C / С
-        86: paste_fn,  # V / М
-        88: cut_fn,    # X / Ч
-        65: sel_fn,    # A / Ф
-        90: undo_fn,   # Z / Я
+        67: copy_fn,   
+        86: paste_fn,  
+        88: cut_fn,    
+        65: sel_fn,    
+        90: undo_fn,   
     }
     def _handler(e):
-        if not (e.state & 0x4):  # Ctrl не зажат
+        if not (e.state & 0x4):  
             return
-        if e.keysym not in ('??', '?'):  # латиница уже обработана стандартными биндингами
+        if e.keysym not in ('??', '?'):  
             return
         fn = KEYCODE_MAP.get(e.keycode)
         if fn is None:
             return
-        if e.keycode == 90 and redo_fn and (e.state & 0x1):  # Ctrl+Shift+Z → redo
+        if e.keycode == 90 and redo_fn and (e.state & 0x1):  
             return redo_fn()
         return fn()
     inner.bind("<KeyPress>", _handler, add="+")
@@ -120,7 +119,7 @@ class AgentGUI(ctk.CTk):
             "TELEGRAM_TOKEN":       ("Telegram Bot Token",   "https://telegram.me/BotFather"),
             "ALLOWED_TELEGRAM_IDS": ("Разрешенные TG ID",    "https://tg-user.id/"),
             "OPENROUTER_API_KEY":   ("OpenRouter API Key",   "https://openrouter.ai/settings/keys"),
-            "OPENAI_BASE_URL":      ("API Base URL",         "https://www.token-calculator.com/blog/llm-api-reference-base-urls-model-ids-2025"),
+            "OPENAI_BASE_URL":      ("API Base URL", "https://www.token-calculator.com/blog/llm-api-reference-base-urls-model-ids-2025"),
             "BRAVE_API_KEY":        ("Brave Search API Key", "https://api-dashboard.search.brave.com/app/keys"),
             "DYNAMICPDF_API_KEY":   ("DynamicPDF API Key",   "https://dpdf.io/"),
             "CHECKO_API_KEY":       ("Checko API Key",       "https://checko.ru/integration/api"),
@@ -164,14 +163,12 @@ class AgentGUI(ctk.CTk):
                 btn.grid(row=current_row, column=2, padx=10, pady=5)
             current_row += 1
 
-        # -- Блок Моделей (Оркестратор / Чат / Эксперт) в один ряд --
         _label(tab, "Роли и Модели ИИ:").grid(row=current_row, column=0, padx=10, pady=5, sticky="nw")
         row_models = ctk.CTkFrame(tab, fg_color="transparent")
         row_models.grid(row=current_row, column=1, columnspan=2, sticky="we", padx=(10, 10), pady=5)
         
         LBL_W = 40
         
-        # 1. Оркестратор
         lbl_orch = ctk.CTkLabel(row_models, text="Оркестр.:", font=F, width=LBL_W, anchor="e")
         lbl_orch.pack(side="left", padx=(0, 5))
         self.e_model_orchestrator = ctk.CTkEntry(row_models, font=F, width=50)
@@ -179,7 +176,6 @@ class AgentGUI(ctk.CTk):
         self.e_model_orchestrator.pack(side="left", fill="x", expand=True, padx=(0, 15))
         self._bind_entry(self.e_model_orchestrator)
         
-        # 2. Чат
         lbl_chat = ctk.CTkLabel(row_models, text="Чат:", font=F, width=LBL_W, anchor="e")
         lbl_chat.pack(side="left", padx=(0, 5))
         self.e_model_chat = ctk.CTkEntry(row_models, font=F, width=50)
@@ -187,7 +183,6 @@ class AgentGUI(ctk.CTk):
         self.e_model_chat.pack(side="left", fill="x", expand=True, padx=(0, 15))
         self._bind_entry(self.e_model_chat)
         
-        # 3. Эксперт
         lbl_exp = ctk.CTkLabel(row_models, text="Код:", font=F, width=LBL_W, anchor="e")
         lbl_exp.pack(side="left", padx=(0, 5))
         self.e_model_expert = ctk.CTkEntry(row_models, font=F, width=50)
@@ -196,7 +191,6 @@ class AgentGUI(ctk.CTk):
         self._bind_entry(self.e_model_expert)
         current_row += 1
 
-        # -- Компактный блок Лимитов --
         _label(tab, "Лимиты и Логи:").grid(row=current_row, column=0, padx=10, pady=5, sticky="w")
         row_limits = ctk.CTkFrame(tab, fg_color="transparent")
         row_limits.grid(row=current_row, column=1, columnspan=2, sticky="we", padx=(10, 0), pady=5)
@@ -212,6 +206,12 @@ class AgentGUI(ctk.CTk):
         self.e_history_limit.insert(0, str(config.get_config("history_limit") or 40))
         self.e_history_limit.pack(side="left", padx=(0, 15))
         self._bind_entry(self.e_history_limit)
+
+        _label(row_limits, "Токены:").pack(side="left", padx=(0, 5))
+        self.e_ctx_limit = ctk.CTkEntry(row_limits, width=60, font=F)
+        self.e_ctx_limit.insert(0, str(config.get_config("LOCAL_CONTEXT_SIZE") or 4096))
+        self.e_ctx_limit.pack(side="left", padx=(0, 15))
+        self._bind_entry(self.e_ctx_limit)
         
         _label(row_limits, "Логи:").pack(side="left", padx=(0, 5))
         self.c_log = ctk.CTkComboBox(row_limits, values=["DEBUG", "INFO", "WARNING", "ERROR"], width=100, font=F)
@@ -219,10 +219,8 @@ class AgentGUI(ctk.CTk):
         self.c_log.pack(side="left", padx=(0, 15))
 
         self._keep_chain_var = tk.BooleanVar(value=bool(config.get_config("keep_chain")))
-        ctk.CTkCheckBox(row_limits, text="Цепочка рассуждений", variable=self._keep_chain_var, font=F).pack(side="left")
         current_row += 1
 
-        # -- Блок Фона --
         _label(tab, "Фоновая активность:").grid(row=current_row, column=0, padx=10, pady=5, sticky="w")
         frame_bg = ctk.CTkFrame(tab, fg_color="transparent")
         frame_bg.grid(row=current_row, column=1, columnspan=2, sticky="we", padx=(10, 0), pady=5)
@@ -234,10 +232,10 @@ class AgentGUI(ctk.CTk):
         self.e_bg_s = ctk.CTkEntry(frame_bg, width=40, font=F); self.e_bg_s.insert(0, str(total_sec % 60)); self.e_bg_s.pack(side="left", padx=(0, 2)); self._bind_entry(self.e_bg_s)
         ctk.CTkLabel(frame_bg, text="с", font=F).pack(side="left", padx=(0, 15))
         self._bg_autostart_var = tk.BooleanVar(value=bool(config.get_config("bg_autostart")))
-        ctk.CTkCheckBox(frame_bg, text="Проверять при старте", variable=self._bg_autostart_var, font=F).pack(side="left")
+        ctk.CTkCheckBox(frame_bg, text="Проверять при старте", variable=self._bg_autostart_var, font=F).pack(side="left", padx=(0, 15))
+        ctk.CTkCheckBox(frame_bg, text="Цепочка рассуждений", variable=self._keep_chain_var, font=F).pack(side="left")
         current_row += 1
 
-        # -- Блок Рабочей Папки --
         _label(tab, "Рабочая папка:").grid(row=current_row, column=0, padx=10, pady=5, sticky="w")
         self.e_work_dir = ctk.CTkEntry(tab, font=F); self.e_work_dir.insert(0, config.get_config("work_dir") or ""); self.e_work_dir.grid(row=current_row, column=1, padx=(10, 0), pady=5, sticky="we"); self._bind_entry(self.e_work_dir)
         def _browse_work_dir():
@@ -348,6 +346,8 @@ class AgentGUI(ctk.CTk):
         data["max_iterations"] = int(self.e_max_iter.get() or 10)
         try: data["history_limit"] = max(4, int(self.e_history_limit.get() or 40))
         except ValueError: data["history_limit"] = 40
+        try: data["LOCAL_CONTEXT_SIZE"] = int(self.e_ctx_limit.get() or 4096)
+        except ValueError: data["LOCAL_CONTEXT_SIZE"] = 4096
         data["log_level"] = self.c_log.get()
         data["keep_chain"] = self._keep_chain_var.get()
         data["model_orchestrator"] = self.e_model_orchestrator.get().strip()
@@ -382,6 +382,7 @@ class AgentGUI(ctk.CTk):
         self._keep_chain_var.set(bool(d.get("keep_chain", False)))
         self.e_max_iter.delete(0, "end"); self.e_max_iter.insert(0, str(d.get("max_iterations", 10)))
         self.e_history_limit.delete(0, "end"); self.e_history_limit.insert(0, str(d.get("history_limit", 40)))
+        self.e_ctx_limit.delete(0, "end"); self.e_ctx_limit.insert(0, str(d.get("LOCAL_CONTEXT_SIZE", 4096)))
         self.c_log.set(d.get("log_level", "INFO"))
 
         logging.info("🔴 Настройки сброшены к значениям по умолчанию.")
@@ -552,6 +553,8 @@ class AgentGUI(ctk.CTk):
                 self.e_max_iter.delete(0, "end"); self.e_max_iter.insert(0, str(cfg["max_iterations"]))
             if "history_limit" in cfg:
                 self.e_history_limit.delete(0, "end"); self.e_history_limit.insert(0, str(cfg["history_limit"]))
+            if "LOCAL_CONTEXT_SIZE" in cfg:
+                self.e_ctx_limit.delete(0, "end"); self.e_ctx_limit.insert(0, str(cfg["LOCAL_CONTEXT_SIZE"]))
             if "log_level" in cfg:
                 self.c_log.set(cfg["log_level"])
 
@@ -984,6 +987,16 @@ class AgentGUI(ctk.CTk):
                 self.append_chat("Вы", msg)
                 self._dispatch_to_agent("ПРИНУДИТЕЛЬНАЯ ИНСТРУКЦИЯ: Изучи наш последний диалог и сохрани факты...")
                 return
+            elif cmd == "update":
+                self.append_chat("Система", "🔄 Обновляю исходный код (git pull)...")
+                import subprocess
+                try:
+                    res = subprocess.run(["git", "pull"], capture_output=True, text=True, timeout=30)
+                    self.append_chat("Система", f"Результат Git:\n{res.stdout}\n{res.stderr}")
+                    self.append_chat("Система", "⚠️ Теперь остановите агента и перезапустите программу для применения обновлений.", close_bubble=True)
+                except Exception as e:
+                    self.append_chat("Система", f"Ошибка: {e}", close_bubble=True)
+                return
             elif cmd == "restart":
                 self.append_chat("Система", "🔄 Перезапуск недоступен в GUI. Используйте кнопку.", close_bubble=True)
                 return
@@ -1034,33 +1047,28 @@ class AgentGUI(ctk.CTk):
             self._dispatch_to_agent(content)
 
         elif ext == 'pdf' or mime == 'application/pdf':
+            pdf_reader = os.path.join(config.get_config_dir(), "read_pdf.py")
             content =[
-                {"type": "text", "text": f"Пользователь прислал PDF-документ: {filename}. Изучи его содержимое."},
-                {"type": "image_url", "image_url": {"url": f"data:application/pdf;base64,{b64}"}},
+                {"type": "text", "text": (
+                    f"Пользователь прислал PDF-документ: {filename}\nПолный путь: {filepath}\n\n"
+                    f"Для извлечения текста используй готовый скрипт:\n"
+                    f"  execute_terminal('python3 {pdf_reader} \"{filepath}\"')\n"
+                    f"Если PDF сканированный (нет текста) — добавь флаг --ocr:\n"
+                    f"  execute_terminal('python3 {pdf_reader} \"{filepath}\" --ocr')\n"
+                    f"Можно читать конкретные страницы: --pages 1-3,5"
+                )}
             ]
             self._dispatch_to_agent(content)
 
         elif ext in ('docx', 'doc', 'xlsx', 'xls'):
-            async def _convert_and_send():
-                pdf_path = await tools.convert_to_pdf(filepath, filename)
-                if pdf_path:
-                    with open(pdf_path, 'rb') as f:
-                        pdf_b64 = base64.b64encode(f.read()).decode('utf-8')
-                    os.remove(pdf_path)
-                    content =[
-                        {"type": "text", "text": f"Пользователь прислал документ: {filename}. Изучи его содержимое."},
-                        {"type": "image_url", "image_url": {"url": f"data:application/pdf;base64,{pdf_b64}"}},
-                    ]
-                else:
-                    content =[{"type": "text", "text": (
-                        f"Пользователь прислал файл: {filename}\n"
-                        f"Полный путь: {filepath}\n"
-                        f"Конвертация в PDF недоступна (проверь DYNAMICPDF_API_KEY и прокси).\n"
-                        f"Попробуй прочитать содержимое через python-docx или другой инструмент."
-                    )}]
-                self._dispatch_to_agent(content)
-
-            asyncio.run_coroutine_threadsafe(_convert_and_send(), self.async_loop)
+            content =[
+                {"type": "text", "text": (
+                    f"Пользователь прислал офисный документ: {filename}\nПолный путь: {filepath}\n\n"
+                    f"Используй `execute_terminal` с Python-скриптом для его чтения "
+                    f"(python-docx для .docx/.doc, openpyxl для .xlsx/.xls)."
+                )}
+            ]
+            self._dispatch_to_agent(content)
             return
 
         elif ext in ('txt', 'py', 'js', 'ts', 'json', 'csv', 'md', 'yaml', 'yml', 'xml', 'html', 'css', 'log'):

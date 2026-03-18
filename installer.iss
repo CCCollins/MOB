@@ -1,6 +1,6 @@
 [Setup]
 AppName=Militech Open Bot
-AppVersion=2.9
+AppVersion=2.92
 DefaultDirName={localappdata}\MOB
 PrivilegesRequired=lowest
 DefaultGroupName=Militech Open Bot
